@@ -1,87 +1,161 @@
 import cv2
 import numpy as np
 
-def detect_meniscus_with_template(main_image_path, template_image_path):
+# isolate_curved_line function remains the same as before...
+def isolate_curved_line(image, lower_bound, upper_bound):
     """
-    Finds a meniscus in a larger image by matching a template image.
+    Takes an image of a shape (like a meniscus), finds the curved parts,
+    and returns a binary image containing only the single longest curve.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    all_edges = cv2.Canny(blurred, lower_bound, upper_bound)
+    
+    straight_lines_mask = np.zeros_like(all_edges)
+    lines = cv2.HoughLinesP(all_edges, 1, np.pi / 180, threshold=50, minLineLength=50, maxLineGap=10)
 
-    This method is robust to low contrast and noise, as it looks for a
-    pattern rather than relying on sharp edges.
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            cv2.line(straight_lines_mask, (x1, y1), (x2, y2), 255, 3)
 
-    Args:
-        main_image_path (str): Path to the image of the cylinder.
-        template_image_path (str): Path to the small, cropped template image
-                                     of the meniscus.
+    curved_line = cv2.subtract(all_edges, straight_lines_mask)
+    contours, _ = cv2.findContours(curved_line, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if contours:
+        longest_contour = max(contours, key=lambda c: cv2.arcLength(c, False))
+        output_mask = np.zeros_like(all_edges)
+        cv2.drawContours(output_mask, [longest_contour], -1, 255, 1)
+        return output_mask
+    else:
+        return np.zeros_like(all_edges)
+
+def detect_meniscus_by_shape(main_image_path, template_image_path):
+    """
+    Finds a meniscus in a larger image by matching the shape of its curved line.
+    This version includes filtering to remove horizontal scale lines.
     """
     # --- Step 1: Load the images ---
     main_image = cv2.imread(main_image_path)
     template = cv2.imread(template_image_path)
 
-    if main_image is None:
-        print(f"Error: Could not load main image from {main_image_path}")
-        return
-    if template is None:
-        print(f"Error: Could not load template image from {template_image_path}")
-        print("Please ensure you have created a 'meniscus_template.png' file.")
+    # Make images a manageable size
+    main_image = cv2.resize(main_image, (0,0), fx=0.25, fy=0.25)
+    template = cv2.resize(template, (0,0), fx=0.25, fy=0.25)
+
+    if main_image is None or template is None:
+        print("Error: Could not load one or both images.")
         return
 
-    detection_image = main_image.copy()
+    # --- Step 1.5: Isolate the Tube by Finding Vertical Walls ---
+    # This section remains unchanged...
+    print("Attempting to isolate the tube from the main image...")
+    gray_for_lines = cv2.cvtColor(main_image, cv2.COLOR_BGR2GRAY)
+    edges_for_lines = cv2.Canny(gray_for_lines, 50, 150)
+    lines = cv2.HoughLinesP(edges_for_lines, rho=1, theta=np.pi/180, threshold=80, minLineLength=100, maxLineGap=20)
+    vertical_lines_x = []
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            angle = np.rad2deg(np.arctan2(y2 - y1, x2 - x1))
+            if 70 < abs(angle) < 120:
+                vertical_lines_x.append((x1 + x2) // 2)
+    if len(vertical_lines_x) >= 2:
+        unique_x = sorted(list(set(vertical_lines_x)))
+        min_dist = float('inf')
+        best_pair = None
+        for i in range(len(unique_x) - 1):
+            dist = unique_x[i+1] - unique_x[i]
+            if dist < min_dist:
+                min_dist = dist
+                best_pair = (unique_x[i], unique_x[i+1])
+        if best_pair:
+            left_wall, right_wall = best_pair
+            padding = 5
+            if (right_wall - padding) > (left_wall + padding):
+                crop_x1 = max(0, left_wall + padding)
+                crop_x2 = min(main_image.shape[1], right_wall - padding)
+                main_image = main_image[:, crop_x1:crop_x2]
+                print(f"Tube walls found. Image cropped between x={crop_x1} and x={crop_x2}.")
+                cv2.imshow("Cropped Tube", main_image)
+            else:
+                print("Warning: Detected tube walls are too close together to crop. Proceeding with uncropped image.")
+    else:
+        print("Warning: Could not robustly identify tube walls. Proceeding with uncropped image.")
     
-    # Convert images to grayscale for matching
+    # --- Step 2: Isolate the template shape and get edges from main image ---
+    print("Processing images to detect shape...")
+    template_shape = isolate_curved_line(template, 60, 150)
     main_gray = cv2.cvtColor(main_image, cv2.COLOR_BGR2GRAY)
-    template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+    main_blurred = cv2.GaussianBlur(main_gray, (5, 5), 0)
+    main_edges = cv2.Canny(main_blurred, 50, 150)
     
-    # Get the width and height of the template
-    template_h, template_w = template_gray.shape[:2]
-    main_h, main_w = main_gray.shape[:2]
+    # --- NEW: Step 3: Filter Out Scale Lines from the Main Image Edges ---
+    print("Filtering out horizontal lines from main image...")
+    
+    # Find all contours in the edge map
+    contours, _ = cv2.findContours(main_edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Create a new blank mask to draw only the contours we want to keep
+    filtered_edges = np.zeros_like(main_edges)
 
-    # --- NEW: Add a check to prevent the OpenCV error ---
-    # The main image must be larger than the template to perform matching.
-    if main_h < template_h or main_w < template_w:
-        print("Error: The main image is smaller than the template image.")
-        print(f"Main image dims: {main_w}x{main_h}, Template dims: {template_w}x{template_h}")
-        print("Please use a larger main image or create a smaller template from the current main image.")
+    for contour in contours:
+        # Get the bounding box for each contour
+        x, y, w, h = cv2.boundingRect(contour)
+        
+        # Calculate aspect ratio
+        aspect_ratio = float(w) / h if h > 0 else 0
+        
+        # Define what a "tick mark" looks like.
+        # It's a rectangle that is very wide but not very tall.
+        # You can adjust these values for your specific images.
+        is_likely_tick_mark = (aspect_ratio > 3.0) and (h < 15)
+
+        # If the contour is NOT a tick mark, we keep it
+        if not is_likely_tick_mark:
+            # Draw this "good" contour onto our blank mask
+            cv2.drawContours(filtered_edges, [contour], -1, 255, 1)
+
+    # --- Step 4: Perform Template Matching on the Filtered Edges ---
+    template_h, template_w = template_shape.shape[:2]
+    
+    if filtered_edges.shape[0] < template_h or filtered_edges.shape[1] < template_w:
+        print("Error: The main image is smaller than the template image after processing.")
         return
 
-    # --- Step 2: Perform Template Matching ---
-    result = cv2.matchTemplate(main_gray, template_gray, cv2.TM_CCOEFF_NORMED)
-    
-    # Find the location of the best match
+    # Use the 'filtered_edges' instead of the original 'main_edges'
+    result = cv2.matchTemplate(filtered_edges, template_shape, cv2.TM_CCOEFF_NORMED)
     min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
     
-    print(f"Template match confidence: {max_val:.2f}")
+    print(f"Shape match confidence: {max_val:.2f}")
 
-    # Set a confidence threshold
-    if max_val > 0.8: # You can adjust this threshold (0.0 to 1.0)
+    detection_image = main_image.copy()
+
+    # --- Step 5: Display the Results ---
+    confidence_threshold = 0.2
+    if max_val > confidence_threshold:
         top_left = max_loc
         bottom_right = (top_left[0] + template_w, top_left[1] + template_h)
-
-        # --- Step 3: Identify the Reading Point ---
-        # The reading is at the bottom-center of the matched template area
         reading_point = (top_left[0] + template_w // 2, top_left[1] + template_h)
         
-        # Draw a rectangle around the detected area
         cv2.rectangle(detection_image, top_left, bottom_right, (0, 255, 0), 2)
-        
-        # Draw a prominent circle at the reading point
-        cv2.circle(detection_image, reading_point, 7, (0, 0, 255), -1)
-        cv2.putText(detection_image, f'Reading: {reading_point}',
-                    (reading_point[0] + 10, reading_point[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+        cv2.putText(detection_image, f'Reading: ({reading_point[0]}, {reading_point[1]})', (top_left[0], top_left[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
         print(f"Meniscus reading point found at {reading_point}")
-
     else:
-        print("No confident match found. The meniscus might not be visible or the template is a poor match.")
+        print("No confident shape match found.")
 
+    cv2.imshow("1. Original Main Image Edges", main_edges)
+    cv2.imshow("2. Filtered Edges (Tick Marks Removed)", filtered_edges) # <-- New window to see the result
+    cv2.imshow("3. Template Shape to Match", template_shape)
+    cv2.imshow("4. Final Detection Result", detection_image)
 
-    # --- Step 4: Display the Result ---
-    cv2.imshow("Detection Image", detection_image)
-
-    print("Press any key to close the windows.")
+    print("\nPress any key to close the windows.")
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
+
 if __name__ == "__main__":
-    # You MUST create this template file yourself by cropping a good example
-    template_file = 'templates/template_3.jpg' 
-    image_file = 'images/cylinder.JPG'
-    detect_meniscus_with_template(image_file, template_file)
+    image_file = 'images/Clear-Images/IMG_3444.jpg' 
+    template_file = 'templates/template_5.jpg' 
+    
+    detect_meniscus_by_shape(image_file, template_file)
