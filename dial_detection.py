@@ -30,8 +30,6 @@ def detect_dial_and_needle(image_path):
         gray_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2GRAY)
         blurred_image = cv2.GaussianBlur(gray_image, (9, 9), 2)
 
-        # Apply thresholding with a value of 150 - REMOVED
-
         # --- Step 3: Detect Circles using the blurred Image ---
         circles = cv2.HoughCircles(blurred_image, cv2.HOUGH_GRADIENT, dp=1.2, minDist=100,
                                    param1=50, param2=30, minRadius=50, maxRadius=int(height/2))
@@ -40,7 +38,12 @@ def detect_dial_and_needle(image_path):
             circles = np.uint16(np.around(circles))
             
             fully_visible_circles = []
-            for (cx, cy, r) in circles[0, :]:
+            for (cx_u, cy_u, r_u) in circles[0, :]:
+                # --- FIX for RuntimeWarning: overflow ---
+                # Cast to standard Python int to prevent unsigned integer overflow/underflow
+                # when checking if the circle is within frame boundaries.
+                cx, cy, r = int(cx_u), int(cy_u), int(r_u)
+
                 if cx - r > 0 and cx + r < width and cy - r > 0 and cy + r < height:
                     fully_visible_circles.append((cx, cy, r))
 
@@ -60,7 +63,8 @@ def detect_dial_and_needle(image_path):
                 # --- Step 4: Detect and Filter Lines (Needle) ---
                 # Use Canny edge detection on the blurred image for better line finding
                 edges = cv2.Canny(blurred_image, 50, 150, apertureSize=3)
-                lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 100, minLineLength=r/3, maxLineGap=20)
+                # Adjust minLineLength relative to radius
+                lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 100, minLineLength=r//2, maxLineGap=20)
                 
                 if lines is not None:
                     # Draw all detected lines in red first
@@ -125,6 +129,6 @@ def detect_dial_and_needle(image_path):
         print(f"An error occurred: {e}")
 
 if __name__ == '__main__':
-    # Using the specified image path
-    image_file = 'images/IMG_7750.png'
+    # ** USER: Update this path to your image file **
+    image_file = 'images/IMG_7750.jpg' 
     detect_dial_and_needle(image_file)
