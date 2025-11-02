@@ -152,10 +152,10 @@ def main_video_loop():
     """
     Main function to capture video, detect dial, calibrate, and show value.
     """
-    cap = cv2.VideoCapture(VIDEO_SOURCE)
+    cap = cv2.VideoCapture(VIDEO_SOURCE, cv2.CAP_V4L2)
+
     if not cap.isOpened():
         print(f"Error: Could not open video source {VIDEO_SOURCE}")
-        return
 
     # --- State variables ---
     dial_circle = None  # Stores (cx, cy, r) of the dial
