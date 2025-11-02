@@ -126,5 +126,5 @@ def detect_dial_and_needle(image_path):
 
 if __name__ == '__main__':
     # Using the specified image path
-    image_file = 'images/dial.JPG'
+    image_file = 'images/IMG_7750.png'
     detect_dial_and_needle(image_file)
