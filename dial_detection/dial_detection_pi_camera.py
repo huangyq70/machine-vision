@@ -9,7 +9,7 @@ from picamera2 import Picamera2 # <-- NEW: Import picamera2
 # ** USER: Set this to the total angular range of your dial in degrees. **
 # Example: If your dial goes from 0 to 100, and the angle between the
 # "0" mark and the "100" mark is 270 degrees, set this to 270.
-DIAL_RANGE_DEGREES = 270.0
+DIAL_RANGE_DEGREES = 250.0
 
 # --- Helper Functions ---
 
@@ -48,7 +48,7 @@ def find_dial_circle(frame):
         dp=1, 
         minDist=height // 4, 
         param1=100, 
-        param2=60,  # <-- Increased to be pickier
+        param2=50,  # <-- Increased to be pickier
         minRadius=int(height * 0.15), 
         maxRadius=int(height * 0.48)
     )
@@ -100,7 +100,7 @@ def get_needle_angle(frame, dial_circle):
         edges, 
         1, 
         np.pi / 180, 
-        threshold=50, 
+        threshold=40, 
         minLineLength=int(r * 0.2), # Find even shorter segments
         maxLineGap=20
     )
@@ -126,7 +126,7 @@ def get_needle_angle(frame, dial_circle):
             # 1. Starts "super close" to the center (min_dist < r * 0.2)
             # 2. Extends far out to be the pointer (max_dist > r * 0.6)
             
-            if min_dist < r * 0.2 and max_dist > r * 0.6:
+            if min_dist < r * 0.2 and max_dist > r * 0.4:
                 # This is a strong candidate for the needle
                 
                 # Get the point that is *farthest* from the center (the tip)
@@ -178,7 +178,7 @@ def main_video_loop():
     zero_angle = None     # The angle of the needle at calibration
     last_time = time.time()
     fps = 0
-    w, h = (1280, 720)    # Default width/height, will be updated
+    w, h = (1920, 1080)    # Default width/height, will be updated
 
     print("Starting video loop...")
     print("Controls:")
