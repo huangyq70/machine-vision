@@ -27,6 +27,7 @@ The picamera2 library comes pre-installed on Raspberry Pi OS, but you need to en
     sudo apt update
     sudo apt install python3-libcamera python3-kms++ python3-prctl libcap-dev
 
+Following this guide from ArduCam is also a great resource. Follow along for the best tips [Visit Here](https://docs.arducam.com/Raspberry-Pi-Camera/Pivariety-Camera/Quick-Start-Guide/#step-1-download-the-installation-script)
 
 
 ### 2. Camera Configuration
