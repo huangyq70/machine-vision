@@ -27,23 +27,14 @@ The picamera2 library comes pre-installed on Raspberry Pi OS, but you need to en
     sudo apt update
     sudo apt install python3-libcamera python3-kms++ python3-prctl libcap-dev
 
-Following this guide from ArduCam is also a great resource. Follow along for the best tips [Visit Here](https://docs.arducam.com/Raspberry-Pi-Camera/Pivariety-Camera/Quick-Start-Guide/#step-1-download-the-installation-script)
+### 2. Camera Drivers
 
+ArduCam provides the best guide (at least for the camera I was provided) on the driver installation steps. Follow the link below and just go step by step in enabling the camera
+[Visit Here](https://docs.arducam.com/Raspberry-Pi-Camera/Pivariety-Camera/Quick-Start-Guide/#step-1-download-the-installation-script)
 
-### 2. Camera Configuration
+Make sure to test the camera and ensure that it actually opens with the command
 
-Ensure your camera is enabled in:
-
-    /boot/firmware/config.txt
-
-For an IMX462 / IMX290, ensure this line exists:
-
-    dtoverlay=imx290,clock-frequency=37125000
-
-Then reboot:
-
-    sudo reboot
-
+    rpicam-still -t 0
 
 
 ### 3. Python Environment Setup (Crucial)
