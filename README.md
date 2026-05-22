@@ -37,6 +37,8 @@ Make sure to test the camera and ensure that it actually opens with the command
     rpicam-still -t 0
 
 
+**If you are not using the ArduCam IMX462 Camera, please use the driver installation instructions for your specific camera. If the script does not work then, please let me know as soon as possible**
+
 ### 3. Python Environment Setup (Crucial)
 
 Because Picamera2 is a system library and OpenCV is a PyPI library, you must create a virtual environment with access to system site packages.
