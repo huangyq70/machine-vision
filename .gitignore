@@ -1,3 +1,5 @@
 .venv/
 images/
 templates/
+__pycache__/
+*.pyc

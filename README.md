@@ -2,7 +2,12 @@
 
 This repository contains two computer vision tools designed for the Raspberry Pi:
 
-- Liquid Level Monitor: Tracks liquid levels in transparent tubes using AprilTags and gradient analysis.
+- Liquid Level Monitor: Measures the liquid volume in a test tube and can drive a
+  pump to stop at a precise target volume. It uses two AprilTags to rectify the
+  tube (perspective + real-world mm scale), a multi-cue meniscus detector that
+  rejects graduation markings and works across lighting conditions, a measured
+  calibration curve for accurate volume (handles conical bottoms and any tube),
+  and a predictive, non-overshooting pump control loop over USB/serial.
 - Analog Gauge Reader: Reads values from analog dial gauges (like pressure or temperature gauges).
 
 
@@ -64,37 +69,114 @@ OpenCV often installs a newer version of NumPy that conflicts with the system-le
 
 
 
-## Tool 1: AprilTag Liquid Level Monitor
+## Tool 1: AprilTag Liquid Level Monitor + Pump Control
 
-Tracks liquid levels in transparent tubes using AprilTags for dynamic ROI alignment and a Gradient Mass algorithm for robust meniscus detection.
+Measures the liquid volume in a test tube and (optionally) drives a pump to a
+precise target volume. The pipeline is split into a hardware-free core library
+(`liquid_detection/liquid_level.py`) plus runnable programs, so the detection
+math can be unit-tested off the Pi.
 
-### Features
+### What makes it accurate and precise
 
-- Dynamic ROI  
-  Uses two AprilTags (Top and Bottom) to automatically find and straighten the test tube view.
+- **AprilTag rectification with a real mm scale.** The two tags (top + bottom)
+  are used to warp the tube column into an upright, fixed-size strip and to
+  derive millimetres-per-pixel from the known 16 mm tag size. This removes
+  camera tilt and perspective and measures in physical units instead of raw,
+  distorted pixels. The strip is referenced to the tags' *inner edges*, so it
+  contains only the tube and never locks onto the tag borders.
 
-- Gradient Mass Detection  
-  Uses morphological filtering to detect liquid levels even in cloudy or low-contrast fluids.
+- **Multi-cue meniscus detector that rejects graduation marks.** Instead of a
+  single gradient, three cues are fused per row: an *edge* cue (the surface
+  line), a median-based *region step* (sustained brightness change between air
+  and liquid), and a *texture step* (crisp markings/background above vs.
+  refraction-blurred liquid below). Printed graduation ticks produce a big edge
+  spike but almost no region/texture step, so they are suppressed — this is what
+  lets it work on graduated tubes and with clear liquids. A weighted centroid
+  gives a sub-pixel surface location.
 
-- Bubble Rejection  
-  Intelligent filtering ignores small bubbles and vertical scratches.
+- **Measured calibration curve for volume.** A `height_mm → volume_ml` curve
+  (built once with `calibrate_tube.py`) linearises the printed scale directly
+  and absorbs the conical/round bottom, the exact bore, and any optical bias.
+  Geometric (cylinder + cone/hemisphere) and linear models are also available.
 
-### Running the Liquid Monitor
+- **Temporal filtering.** Confidence gating, outlier rejection, a median +
+  EMA filter, a least-squares flow-rate estimate, and a stability flag produce
+  a smooth, low-jitter reading suitable for closed-loop control.
 
-Open liquid_detection/liquid_level_detection_pi_(NEW).py and run the program
+- **Predictive, non-overshooting pump stop.** The controller keeps the pump
+  running until `volume ≥ target − flow_rate × stop_latency − margin`, so the
+  liquid already in transit lands on the target instead of overshooting. It
+  streams the live volume continuously and latches off once the target is hit.
+
+### Calibrate your tube (once, for best accuracy)
+
+    python liquid_detection/calibrate_tube.py --config liquid_detection/config.example.json \
+           --out calibration.csv
+
+Add known amounts of liquid (syringe/burette, or fill to printed lines), press
+`c` and type the true volume for 6–12 levels spanning empty→full, then press
+`s`. See `liquid_detection/calibration.example.csv` for the format.
+
+### Running the Liquid Monitor + pump
+
+    python liquid_detection/liquid_level_monitor.py \
+           --config liquid_detection/config.example.json \
+           --calibration calibration.csv \
+           --port /dev/ttyACM0 --target 25
+
+- `--port` is the pump's USB serial device (often `/dev/ttyACM0` or
+  `/dev/ttyUSB0`). Omit it for a dry run that prints the pump commands.
+- `--target` is the volume in mL to stop at; `--drain` reverses the direction.
+- No calibration yet? Pass `--capacity 50` for a rough linear model to see it
+  working, then calibrate for real accuracy.
 
 ### Controls (Liquid Monitor)
 
-- q: Quit
+- `q`: Quit
+- `space`: Start / pause dosing toward the target
+- `+` / `-`: Raise / lower the target by 0.5 mL
+- `d`: Toggle fill / drain direction
+- `r`: Reset the temporal filter
+
+### Pump wiring and protocol
+
+The Pi talks to the pump over the USB cable as a serial link. Set the command
+strings in `pump_controller.py` (`PumpConfig.cmd_run`, `cmd_stop`,
+`cmd_setpoint`, `stream_format`) to match your pump's firmware. Defaults send
+readable ASCII lines (`RUN\n`, `STOP\n`, `V:12.34\n`) and the live volume is
+streamed continuously so the pump/host always has the latest reading. The old
+`print` / `autoPrint` / `stopPrint` text queries are still answered for
+backward compatibility.
 
 ### Configuration
 
-You can adjust these variables to your current setup:
+Edit `liquid_detection/config.example.json` (or pass your own with `--config`):
 
-    TUBE_CAPACITY: Total volume of your tube in ml (default: 15.0)
-    SMOOTHING_WINDOW: How many frames are used to find the median volume
-    GRADIENT_FILTER_WIDTH: How wide the features need to cover to be recogonized
-    GRADIENT_SUM_WIDTH: what area of the middle needs to be used to calc the gradient change
+    tube.tag_size_mm          Inner black square size of your AprilTags (mm)
+    tube.strip_height_px      Resolution of the rectified tube strip
+    tube.width_to_tag_ratio   Strip half-width as a multiple of the tag size
+    meniscus.step_band_mm     Band size for the region/texture step (> tick spacing)
+    meniscus.w_edge/region/texture   Cue weights in the fused score
+    meniscus.min_confidence   Minimum confidence to accept a reading
+
+Command-line flags on the monitor cover `--stop-latency`, `--tolerance`,
+`--geometry`, and `--capacity`.
+
+### Tests
+
+The detection math is covered by hardware-free synthetic tests (sub-pixel
+accuracy, graduation-mark rejection, calibration interpolation, tube geometry,
+and the predictive pump stop):
+
+    python liquid_detection/tests/test_liquid_level.py
+
+### Legacy scripts
+
+The earlier prototypes remain for reference:
+`liquid_level_detection_pi_(NEW).py` (gradient-mass),
+`liquid_detection_threshold_(OLD).py`, and
+`liquid_level_detection_communication_protocol.py`. The new modular pipeline
+above supersedes them.
 
 
 

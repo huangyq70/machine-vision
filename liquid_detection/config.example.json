@@ -1,0 +1,25 @@
+{
+  "tube": {
+    "tag_family": "DICT_APRILTAG_36h11",
+    "tag_size_mm": 16.0,
+    "top_tag_id": 0,
+    "bottom_tag_id": 1,
+    "use_tag_ids": true,
+    "strip_height_px": 512,
+    "strip_width_px": 160,
+    "width_to_tag_ratio": 0.75,
+    "tube_capacity_ml": 50.0
+  },
+  "meniscus": {
+    "center_width_frac": 0.72,
+    "row_margin_frac": 0.06,
+    "step_band_mm": 6.0,
+    "step_gap_mm": 0.8,
+    "w_edge": 0.34,
+    "w_region": 0.40,
+    "w_texture": 0.26,
+    "refine_window_mm": 4.0,
+    "min_confidence": 0.18,
+    "use_clahe": true
+  }
+}
