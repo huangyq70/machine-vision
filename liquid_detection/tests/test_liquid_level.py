@@ -291,8 +291,32 @@ def test_pump_legacy_query_protocol():
     link = MockPumpLink()
     ctl = PumpController(link, PumpConfig(stream=False))
     link.feed("print")
-    ctl.update(7.5, 0.0, confidence=1.0, timestamp=0.0)
-    assert any("7.5" in s for s in link.sent), "did not answer legacy print query"
+    ctl.update(7.53, 0.0, confidence=1.0, timestamp=0.0)
+    # Must match the ORIGINAL firmware format exactly: one decimal, 'mL', CRLF.
+    assert "7.5mL\r\n" in link.sent, f"bad legacy reply format: {link.sent}"
+
+
+def test_pump_legacy_autoprint_stream_and_stop():
+    link = MockPumpLink()
+    ctl = PumpController(link, PumpConfig(stream=False, auto_query_interval_s=0.5))
+    # Pump requests continuous streaming (the flag is set; first stream comes
+    # one interval later, matching the original rate-limited behaviour).
+    link.feed("autoPrint")
+    ctl.update(3.0, 0.0, 1.0, timestamp=0.0)
+    # First stream after the interval elapses.
+    ctl.update(3.1, 0.0, 1.0, timestamp=0.6)
+    assert "3.1mL\r\n" in link.sent
+    # Within the interval -> no new stream line.
+    n = len(link.sent)
+    ctl.update(3.15, 0.0, 1.0, timestamp=0.7)
+    assert len(link.sent) == n, "auto-stream not rate-limited"
+    # After another interval -> streams again.
+    ctl.update(3.2, 0.0, 1.0, timestamp=1.2)
+    assert "3.2mL\r\n" in link.sent
+    # Pump says stop -> streaming ceases.
+    link.feed("stopPrint")
+    ctl.update(3.4, 0.0, 1.0, timestamp=2.0)
+    assert not any("3.4" in s for s in link.sent), "did not stop auto-stream"
 
 
 # ---------------------------------------------------------------------------

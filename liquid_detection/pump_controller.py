@@ -136,6 +136,10 @@ class PumpConfig:
     cmd_setpoint: Optional[str] = None  # e.g. "SET:{target:.2f}\n"; None disables
     stream_format: str = "V:{volume:.2f}\n"
     answer_queries: bool = True         # honour legacy print/autoPrint/stopPrint
+    # Legacy query protocol (matches the original communication_protocol.py so
+    # a pump built around it works unchanged). Reply format + auto interval:
+    query_response_format: str = "{volume:.1f}mL\r\n"
+    auto_query_interval_s: float = 0.5
 
 
 @dataclass
@@ -167,6 +171,7 @@ class PumpController:
         self._over_count = 0
         self._last_stream_t = 0.0
         self._auto_query = False
+        self._last_auto_t = 0.0
         self._last_volume = 0.0
 
     # --- target management ---
@@ -215,7 +220,7 @@ class PumpController:
             timestamp = time.time()
 
         # Handle any inbound legacy text commands first.
-        self._handle_queries(volume_ml)
+        self._handle_queries(volume_ml, timestamp)
 
         streamed = False
         if cfg.stream and (timestamp - self._last_stream_t) >= cfg.stream_min_interval_s:
@@ -254,19 +259,25 @@ class PumpController:
             predicted_stop_ml=predicted,
         )
 
-    def _handle_queries(self, volume_ml: float):
-        """Backward-compatible text protocol from the previous firmware."""
+    def _handle_queries(self, volume_ml: float, timestamp: float):
+        """
+        Backward-compatible text protocol from the original firmware
+        (communication_protocol.py). The pump sends 'autoPrint' / 'stopPrint' /
+        'print'; we reply with the volume in the exact legacy format and rate.
+        """
         if not self.cfg.answer_queries:
             return
+        fmt = self.cfg.query_response_format
         incoming = self.link.read_available()
-        if not incoming:
-            if self._auto_query:
-                self.link.write_line(f"{volume_ml:.2f}mL\n")
-            return
-        low = incoming.lower()
-        if "autoprint" in low:
-            self._auto_query = True
-        elif "stopprint" in low:
-            self._auto_query = False
-        elif "print" in low:
-            self.link.write_line(f"{volume_ml:.2f}mL\n")
+        if incoming:
+            low = incoming.lower()
+            if "autoprint" in low:
+                self._auto_query = True
+            elif "stopprint" in low:
+                self._auto_query = False
+            elif "print" in low:
+                self.link.write_line(fmt.format(volume=volume_ml))
+        # Continuous auto-stream, rate-limited like the original (0.5 s).
+        if self._auto_query and (timestamp - self._last_auto_t) >= self.cfg.auto_query_interval_s:
+            self.link.write_line(fmt.format(volume=volume_ml))
+            self._last_auto_t = timestamp

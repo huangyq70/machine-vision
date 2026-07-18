@@ -132,6 +132,9 @@ def main():
     ap.add_argument("--stop-latency", type=float, default=0.25,
                     help="pump/plumbing stop latency (s) for predictive cutoff")
     ap.add_argument("--tolerance", type=float, default=0.1, help="target tolerance (ml)")
+    ap.add_argument("--legacy-protocol", action="store_true",
+                    help="responder mode matching the original firmware: pump "
+                         "polls print/autoPrint/stopPrint, Pi replies '<x.x>mL'")
     ap.add_argument("--no-pi", action="store_true")
     ap.add_argument("--no-window", action="store_true", help="headless (no GUI)")
     args = ap.parse_args()
@@ -156,6 +159,14 @@ def main():
         target_ml=args.target, tolerance_ml=args.tolerance,
         stop_latency_s=args.stop_latency,
     )
+    if args.legacy_protocol:
+        # Responder mode: the pump is the master. It polls with
+        # print/autoPrint/stopPrint and decides when to stop itself; the Pi only
+        # answers with the volume in the original "<x.x>mL\r\n" format. No V:
+        # stream and no RUN/STOP are ever sent.
+        pump_cfg.stream = False
+        pump_cfg.answer_queries = True
+        print("[monitor] LEGACY responder mode: streaming volume as '<x.x>mL' on request.")
     controller = PumpController(link, pump_cfg)
     target = args.target
     dosing = False
