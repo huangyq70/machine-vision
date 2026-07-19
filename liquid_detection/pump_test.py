@@ -81,6 +81,11 @@ def main():
     ap.add_argument("--baud", type=int, default=9600)
     ap.add_argument("--send", action="append", default=[],
                     help="send this line (repeatable); newline appended")
+    ap.add_argument("--emit", default=None,
+                    help="repeatedly send this text (e.g. '10.0mL\\r') to test a "
+                         "pump that LISTENS for the volume; watch the hardware")
+    ap.add_argument("--rate", type=float, default=0.5,
+                    help="seconds between --emit sends (default 0.5)")
     ap.add_argument("--wait", type=float, default=1.0,
                     help="seconds to listen after each --send")
     ap.add_argument("--no-newline", action="store_true",
@@ -114,6 +119,24 @@ def main():
                     print(f"  <- {ser.read(n)!r}")
                 else:
                     time.sleep(0.05)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            ser.close()
+            print("\nClosed.")
+        return
+
+    # Repeatedly emit a value to test a pump that listens for the volume.
+    if args.emit is not None:
+        payload = unescape(args.emit) + term.encode()
+        print(f"Emitting {payload!r} every {args.rate}s on {args.port} @ {args.baud}.")
+        print("Watch the pump: does it start/stop/react? Ctrl-C to stop.")
+        try:
+            while True:
+                ser.write(payload)
+                print(f"  -> {payload!r}")
+                drain(ser, min(args.rate, 0.4))
+                time.sleep(max(0.0, args.rate - 0.4))
         except KeyboardInterrupt:
             pass
         finally:
