@@ -75,6 +75,8 @@ def drain(ser, seconds):
 def main():
     ap = argparse.ArgumentParser(description="Pump serial comms tester")
     ap.add_argument("--scan", action="store_true", help="list serial ports and exit")
+    ap.add_argument("--listen", action="store_true",
+                    help="passively print everything the pump sends (read-only)")
     ap.add_argument("--port")
     ap.add_argument("--baud", type=int, default=9600)
     ap.add_argument("--send", action="append", default=[],
@@ -100,6 +102,25 @@ def main():
         sys.exit(1)
 
     term = "" if args.no_newline else "\n"
+
+    # Passive listen: print everything the pump sends, send nothing.
+    if args.listen:
+        print(f"Listening on {args.port} @ {args.baud} (read-only). Ctrl-C to stop.")
+        print("If the pump polls the Pi, you should see 'print' / 'autoPrint' here.")
+        try:
+            while True:
+                n = ser.in_waiting if hasattr(ser, "in_waiting") else 0
+                if n:
+                    print(f"  <- {ser.read(n)!r}")
+                else:
+                    time.sleep(0.05)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            ser.close()
+            print("\nClosed.")
+        return
+
     print(f"Opened {args.port} @ {args.baud}. Ctrl-C or 'quit' to exit.")
 
     # Non-interactive canned bursts.
