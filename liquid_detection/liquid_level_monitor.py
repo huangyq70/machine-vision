@@ -135,6 +135,14 @@ def main():
     ap.add_argument("--legacy-protocol", action="store_true",
                     help="responder mode matching the original firmware: pump "
                          "polls print/autoPrint/stopPrint, Pi replies '<x.x>mL'")
+    ap.add_argument("--stream-format", default=r"{volume:.1f}\r\n",
+                    help=r"ASCII line streamed to a listener pump each interval. "
+                         r"Use {volume} and \r \n escapes. Default '{volume:.1f}\r\n' "
+                         r"(number only, CRLF). Add units with '{volume:.1f}mL\r\n'.")
+    ap.add_argument("--stream-interval", type=float, default=0.3,
+                    help="seconds between streamed volume lines (default 0.3)")
+    ap.add_argument("--no-stream", action="store_true",
+                    help="do not continuously stream the volume to the pump")
     ap.add_argument("--no-pi", action="store_true")
     ap.add_argument("--no-window", action="store_true", help="headless (no GUI)")
     args = ap.parse_args()
@@ -154,11 +162,19 @@ def main():
         link = MockPumpLink()
         print("[monitor] no --port; using MOCK pump link (prints commands).")
 
+    # Decode \r \n etc. from the CLI string into real control characters.
+    stream_fmt = args.stream_format.encode("ascii", "ignore").decode("unicode_escape")
+
     pump_cfg = PumpConfig(
         direction=Direction.DRAIN if args.drain else Direction.FILL,
         target_ml=args.target, tolerance_ml=args.tolerance,
         stop_latency_s=args.stop_latency,
+        stream=not args.no_stream,
+        stream_format=stream_fmt,
+        stream_min_interval_s=args.stream_interval,
     )
+    print(f"[monitor] streaming volume to pump as {stream_fmt!r} every "
+          f"{args.stream_interval}s" if pump_cfg.stream else "[monitor] volume stream OFF")
     if args.legacy_protocol:
         # Responder mode: the pump is the master. It polls with
         # print/autoPrint/stopPrint and decides when to stop itself; the Pi only
@@ -197,10 +213,15 @@ def main():
                           f"(target {target:.2f}). Pump stopped.")
                     dosing = False
             else:
-                # Still stream the live volume even when not dosing.
+                # Still stream the live volume even when not dosing. Hold the
+                # last good value if this frame was momentarily unreadable so we
+                # never send a spurious 0.0 to the pump.
+                vol = reading.volume_ml
+                if not np.isfinite(vol):
+                    vol = 0.0
                 if isinstance(link, MockPumpLink) or args.port:
-                    controller.update(reading.volume_ml if reading.ok else 0.0,
-                                      reading.flow_ml_per_s, reading.confidence, now)
+                    controller.update(vol, reading.flow_ml_per_s,
+                                      reading.confidence, now)
 
             if not args.no_window:
                 dash = make_dashboard(frame, estimator.last_rect, estimator,
