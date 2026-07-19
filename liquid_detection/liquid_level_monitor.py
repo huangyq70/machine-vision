@@ -208,6 +208,8 @@ def main():
                 out = controller.update(reading.volume_ml if reading.ok else float("nan"),
                                         reading.flow_ml_per_s, reading.confidence, now)
                 reading.__dict__["rem"] = out.remaining_ml
+                if out.query_event:
+                    print(f"[pump] {out.query_event}")
                 if out.state == PumpState.REACHED and dosing:
                     print(f"[pump] TARGET REACHED at {reading.volume_ml:.2f} mL "
                           f"(target {target:.2f}). Pump stopped.")
@@ -220,8 +222,10 @@ def main():
                 if not np.isfinite(vol):
                     vol = 0.0
                 if isinstance(link, MockPumpLink) or args.port:
-                    controller.update(vol, reading.flow_ml_per_s,
-                                      reading.confidence, now)
+                    out = controller.update(vol, reading.flow_ml_per_s,
+                                            reading.confidence, now)
+                    if out.query_event:
+                        print(f"[pump] {out.query_event}")
 
             if not args.no_window:
                 dash = make_dashboard(frame, estimator.last_rect, estimator,

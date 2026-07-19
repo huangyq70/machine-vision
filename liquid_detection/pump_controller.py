@@ -150,6 +150,7 @@ class ControlOutput:
     at_target: bool
     remaining_ml: float
     predicted_stop_ml: float           # volume threshold at which we cut off
+    query_event: Optional[str] = None  # legacy command received/answered this cycle
 
 
 class PumpController:
@@ -173,6 +174,7 @@ class PumpController:
         self._auto_query = False
         self._last_auto_t = 0.0
         self._last_volume = 0.0
+        self._query_event = None
 
     # --- target management ---
     def set_target(self, target_ml: float, direction: Optional[Direction] = None):
@@ -220,6 +222,7 @@ class PumpController:
             timestamp = time.time()
 
         # Handle any inbound legacy text commands first.
+        self._query_event = None
         self._handle_queries(volume_ml, timestamp)
 
         streamed = False
@@ -256,7 +259,7 @@ class PumpController:
         return ControlOutput(
             state=self.state, command=command, streamed=streamed,
             at_target=at_target, remaining_ml=remaining,
-            predicted_stop_ml=predicted,
+            predicted_stop_ml=predicted, query_event=self._query_event,
         )
 
     def _handle_queries(self, volume_ml: float, timestamp: float):
@@ -273,11 +276,18 @@ class PumpController:
             low = incoming.lower()
             if "autoprint" in low:
                 self._auto_query = True
+                self._query_event = "RX 'autoPrint' -> auto-upload ON"
             elif "stopprint" in low:
                 self._auto_query = False
+                self._query_event = "RX 'stopPrint' -> auto-upload OFF"
             elif "print" in low:
-                self.link.write_line(fmt.format(volume=volume_ml))
+                reply = fmt.format(volume=volume_ml)
+                self.link.write_line(reply)
+                self._query_event = f"RX 'print' -> TX {reply!r}"
         # Continuous auto-stream, rate-limited like the original (0.5 s).
         if self._auto_query and (timestamp - self._last_auto_t) >= self.cfg.auto_query_interval_s:
-            self.link.write_line(fmt.format(volume=volume_ml))
+            reply = fmt.format(volume=volume_ml)
+            self.link.write_line(reply)
             self._last_auto_t = timestamp
+            if self._query_event is None:
+                self._query_event = f"auto-upload -> TX {reply!r}"
