@@ -186,6 +186,7 @@ def main():
     controller = PumpController(link, pump_cfg)
     target = args.target
     dosing = False
+    last_status_print = 0.0
 
     cam = open_camera(prefer_pi=not args.no_pi)
     window = "Liquid Level Monitor"
@@ -253,6 +254,13 @@ def main():
                                                 else Direction.FILL)
                     print(f"[pump] direction -> {controller.cfg.direction.value}")
             else:
+                # Headless: print a throttled status line so you get feedback
+                # without the GUI (and without the fontconfig/Qt noise).
+                if now - last_status_print >= 0.5:
+                    print(f"[level] {reading.volume_ml:6.2f} mL  "
+                          f"h={reading.height_mm:5.1f}mm  conf={reading.confidence:.2f}  "
+                          f"{reading.status}", flush=True)
+                    last_status_print = now
                 time.sleep(0.01)
     finally:
         controller.pause()
