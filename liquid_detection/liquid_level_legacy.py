@@ -194,6 +194,14 @@ def main():
                     help=r"streamed ASCII line; use {volume} and \r \n (default '{volume:.1f}mL\r\n')")
     ap.add_argument("--no-window", action="store_true", help="headless (no GUI)")
     ap.add_argument("--no-pi", action="store_true", help="force USB webcam")
+    # --- Stabilisation (stops the number flickering when the level is static) ---
+    ap.add_argument("--smooth", type=int, default=31,
+                    help="median window in frames (bigger = steadier, more lag)")
+    ap.add_argument("--ema", type=float, default=0.15,
+                    help="EMA factor 0-1 (smaller = smoother, more lag; 1 = off)")
+    ap.add_argument("--deadband", type=float, default=0.1,
+                    help="mL; the shown/sent value only moves when it changes by "
+                         "more than this (holds steady when the level isn't changing)")
     args = ap.parse_args()
 
     fmt = args.fmt.encode("ascii", "ignore").decode("unicode_escape")
@@ -217,9 +225,11 @@ def main():
     if not args.no_window:
         cv2.namedWindow(window)
 
-    vol_history = deque(maxlen=SMOOTHING_WINDOW)
+    vol_history = deque(maxlen=max(1, args.smooth))
     last_stream = 0.0
     last_print = 0.0
+    ema_vol = None        # smoothed value
+    held_vol = None       # deadbanded value that is actually shown/sent
     print("\nSystem ready. Ctrl-C (headless) or 'q' (window) to quit.")
 
     try:
@@ -231,21 +241,39 @@ def main():
             viz, volume, status = process_frame(
                 frame, detector, vol_history, args.capacity, want_viz=not args.no_window)
 
-            # --- Stream the volume to the pump (the method that works) ---
+            # --- Stabilisation pipeline -------------------------------------
+            # The median (done in process_frame over --smooth frames) already
+            # rejects occasional edge-snap spikes. On top of it:
+            #  1) EMA smoothing to iron out sub-frame wobble,
+            #  2) a deadband so the shown/sent number only moves on a real
+            #     change and stays rock-steady when the level is static.
+            if ema_vol is None:
+                ema_vol = volume
+            else:
+                ema_vol += args.ema * (volume - ema_vol)
+            if held_vol is None or abs(ema_vol - held_vol) >= args.deadband:
+                held_vol = ema_vol
+            out_vol = round(held_vol, 1)
+
+            # --- Stream the stabilised volume to the pump -------------------
             if serial_port and (now - last_stream) >= args.interval:
                 try:
-                    serial_port.write(fmt.format(volume=volume).encode("ascii", "ignore"))
+                    serial_port.write(fmt.format(volume=out_vol).encode("ascii", "ignore"))
                 except Exception as e:  # noqa: BLE001
                     print(f"[legacy] serial write error: {e}")
                 last_stream = now
 
             if not args.no_window:
-                cv2.imshow(window, viz)
+                if viz is not None:
+                    cv2.putText(viz, f"{out_vol:.1f} mL (stable)", (20, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                    cv2.imshow(window, viz)
                 if (cv2.waitKey(1) & 0xFF) == ord('q'):
                     break
             else:
                 if now - last_print >= 0.5:
-                    print(f"[level] {volume:5.1f} mL   {status}", flush=True)
+                    print(f"[level] {out_vol:5.1f} mL   (raw {volume:5.1f})   {status}",
+                          flush=True)
                     last_print = now
     except KeyboardInterrupt:
         pass
