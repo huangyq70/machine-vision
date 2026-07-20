@@ -50,6 +50,8 @@ from typing import Optional, Tuple, List
 import numpy as np
 import cv2
 
+from aruco_compat import make_aruco_detector
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -111,15 +113,9 @@ class AprilTagLocator:
 
     def __init__(self, cfg: TubeConfig):
         self.cfg = cfg
-        dictionary = cv2.aruco.getPredefinedDictionary(cfg.aruco_dict())
-        params = cv2.aruco.DetectorParameters()
-        # Sub-pixel corner refinement dramatically improves the mm scale and the
-        # rectification stability -- cheap and worth it.
-        try:
-            params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-        except Exception:
-            pass
-        self.detector = cv2.aruco.ArucoDetector(dictionary, params)
+        # Version-agnostic detector (works on OpenCV <4.7 and >=4.7). Sub-pixel
+        # corner refinement is enabled inside when available.
+        self.detector = make_aruco_detector(cfg.tag_family)
 
     def detect(self, gray: np.ndarray):
         """Return (corners, ids) as given by the ArUco detector."""

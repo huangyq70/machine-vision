@@ -35,6 +35,7 @@ import numpy as np
 import cv2
 
 from hardware import open_camera
+from aruco_compat import make_aruco_detector
 
 # --- Original detection settings (from the main-branch script) ---
 SMOOTHING_WINDOW = 15          # frames for median filtering of volume
@@ -209,8 +210,7 @@ def main():
     else:
         print("[legacy] no --port; running detection only (no pump output).")
 
-    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
-    detector = cv2.aruco.ArucoDetector(dictionary, cv2.aruco.DetectorParameters())
+    detector = make_aruco_detector("DICT_APRILTAG_36h11")
 
     cam = open_camera(prefer_pi=not args.no_pi)
     window = "Liquid Level (Gradient) + Pump"
