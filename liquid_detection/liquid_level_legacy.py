@@ -275,6 +275,21 @@ def main():
     last_print = 0.0
     ema_vol = None        # smoothed value
     held_vol = None       # deadbanded value that is actually shown/sent
+
+    # Live-tunable calibration (adjustable from the window with the keys below).
+    capacity = args.capacity
+    cone_frac = args.cone_frac
+
+    def snap():
+        """Reset the smoothing so the reading jumps to the new calibration."""
+        return None, None
+
+    if not args.no_window:
+        print("\nLIVE TUNING (in the window):")
+        print("  ] / [   capacity  +/- 0.5 mL")
+        print("  = / -   cone-frac +/- 0.01   (bigger = less volume near the bottom)")
+        print("  p       print current values to paste into your command")
+        print("  q       quit")
     print("\nSystem ready. Ctrl-C (headless) or 'q' (window) to quit.")
 
     try:
@@ -284,8 +299,8 @@ def main():
                 continue
             now = time.time()
             viz, volume, status = process_frame(
-                frame, detector, vol_history, args.capacity,
-                cone_frac=args.cone_frac, use_original_curve=args.original_curve,
+                frame, detector, vol_history, capacity,
+                cone_frac=cone_frac, use_original_curve=args.original_curve,
                 want_viz=not args.no_window)
 
             # --- Stabilisation pipeline -------------------------------------
@@ -314,9 +329,26 @@ def main():
                 if viz is not None:
                     cv2.putText(viz, f"{out_vol:.1f} mL (stable)", (20, 40),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                    # Calibration HUD.
+                    curve = "original" if args.original_curve else f"cone {cone_frac:.2f}"
+                    cv2.putText(viz, f"capacity {capacity:.1f} mL  |  {curve}",
+                                (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    cv2.putText(viz, "[ ] capacity   - = cone   p print   q quit",
+                                (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
                     cv2.imshow(window, viz)
-                if (cv2.waitKey(1) & 0xFF) == ord('q'):
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
                     break
+                elif key == ord(']'):
+                    capacity = round(capacity + 0.5, 2); ema_vol = held_vol = None
+                elif key == ord('['):
+                    capacity = round(max(0.5, capacity - 0.5), 2); ema_vol = held_vol = None
+                elif key == ord('='):   # '+' without shift
+                    cone_frac = round(min(0.9, cone_frac + 0.01), 3); ema_vol = held_vol = None
+                elif key == ord('-'):
+                    cone_frac = round(max(0.0, cone_frac - 0.01), 3); ema_vol = held_vol = None
+                elif key == ord('p'):
+                    print(f"[tune] --capacity {capacity:g} --cone-frac {cone_frac:g}", flush=True)
             else:
                 if now - last_print >= 0.5:
                     print(f"[level] {out_vol:5.1f} mL   (raw {volume:5.1f})   {status}",
@@ -329,6 +361,9 @@ def main():
         if serial_port:
             serial_port.close()
         cv2.destroyAllWindows()
+        # Remind the user of the final calibration so they can bake it in.
+        if not args.original_curve:
+            print(f"\n[tune] final calibration:  --capacity {capacity:g} --cone-frac {cone_frac:g}")
 
 
 if __name__ == "__main__":
