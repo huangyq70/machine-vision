@@ -220,6 +220,16 @@ def process_frame(frame, detector, vol_history, tube_capacity,
                     label = f"{current_volume:.1f}ml ({(current_volume/tube_capacity)*100:.0f}%)"
                     cv2.putText(view_result, label, (roi_x2 + 15, meniscus_global_y),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+            # Subtle marker for where the conical bottom begins (thin dashed
+            # line, muted colour, small label -- just enough to see it).
+            if want_viz and not use_original_curve and 0.0 < cone_frac < 1.0:
+                cy = int(roi_y2 - cone_frac * (roi_y2 - roi_y1))
+                cone_col = (150, 170, 90)
+                for x in range(roi_x1, roi_x2, 12):
+                    cv2.line(view_result, (x, cy), (min(x + 6, roi_x2), cy), cone_col, 1)
+                cv2.putText(view_result, "cone", (roi_x1 + 2, cy - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, cone_col, 1)
     else:
         status = "No Tags Found" if ids is None else "ROI Error"
 
