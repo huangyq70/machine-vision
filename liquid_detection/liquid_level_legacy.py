@@ -60,6 +60,41 @@ def calculate_volume_from_height(height_pct, max_capacity):
     return v_at_split + (height_above_split / h_remaining_range) * v_remaining_range
 
 
+def calculate_volume_conical(height_pct, max_capacity, cone_frac):
+    """
+    Cone + cylinder volume model for a conical-bottom tube.
+
+    The tube is modelled as a cone occupying the bottom ``cone_frac`` of the
+    measured height (radius growing linearly from the tip up to the tube bore),
+    topped by a straight cylinder. Because the cone is narrow near the tip, the
+    volume there grows with the CUBE of height -- far less per mm than the
+    cylinder -- which is exactly what the old piece-wise-linear curve got wrong.
+
+      * for h <= cone:   V = C/(3D) * h^3 / f^2         (cubic, the cone)
+      * for h  > cone:   V = C * (h - 2f/3) / D          (linear, the cylinder)
+      with f = cone_frac, D = (1 - 2f/3), h = height fraction (0..1), C = capacity.
+
+    cone_frac = 0 reduces to a straight linear fill. Both branches meet
+    continuously at h = f, and V(1) == max_capacity exactly.
+
+    Set cone_frac to (height of the conical section) / (height between the
+    bottom and top tag references). Measure it once with a ruler, or tune it so
+    the reading matches the tube's printed graduations near the bottom.
+    """
+    f = float(cone_frac)
+    if height_pct <= 0:
+        return 0.0
+    if height_pct >= 1:
+        return float(max_capacity)
+    if f <= 0:
+        return float(height_pct * max_capacity)
+    f = min(f, 0.99)
+    denom = 1.0 - (2.0 * f / 3.0)
+    if height_pct <= f:
+        return float(max_capacity / (3.0 * denom) * (height_pct ** 3) / (f * f))
+    return float(max_capacity * (height_pct - 2.0 * f / 3.0) / denom)
+
+
 def find_meniscus_gradient_mass(roi_gray):
     """Original Gradient Mass meniscus finder. Returns (best_y, viz, max_score)."""
     h, w = roi_gray.shape
@@ -101,7 +136,8 @@ def find_meniscus_gradient_mass(roi_gray):
     return best_y, grad_viz, max_score
 
 
-def process_frame(frame, detector, vol_history, tube_capacity, want_viz=True):
+def process_frame(frame, detector, vol_history, tube_capacity,
+                  cone_frac=0.0, use_original_curve=False, want_viz=True):
     """
     Original processing pipeline. Returns (viz_or_None, current_volume, status).
     """
@@ -167,7 +203,10 @@ def process_frame(frame, detector, vol_history, tube_capacity, want_viz=True):
 
                 vol_history.append(pct)
                 pct = float(np.median(vol_history))
-                current_volume = calculate_volume_from_height(pct, tube_capacity)
+                if use_original_curve:
+                    current_volume = calculate_volume_from_height(pct, tube_capacity)
+                else:
+                    current_volume = calculate_volume_conical(pct, tube_capacity, cone_frac)
 
                 if want_viz:
                     cv2.line(view_result, (roi_x1 - 20, meniscus_global_y),
@@ -189,6 +228,12 @@ def main():
     ap.add_argument("--port", default=None, help="pump serial port, e.g. /dev/ttyUSB0")
     ap.add_argument("--baud", type=int, default=9600)
     ap.add_argument("--capacity", type=float, default=12.0, help="tube capacity in mL")
+    ap.add_argument("--cone-frac", type=float, default=0.15,
+                    help="fraction of the measured height taken by the conical "
+                         "bottom (cone height / distance between tags). Models the "
+                         "narrow tip so bottom readings are accurate. 0 = linear.")
+    ap.add_argument("--original-curve", action="store_true",
+                    help="use the old 2/15 piece-wise curve instead of the cone model")
     ap.add_argument("--interval", type=float, default=0.5, help="seconds between streamed lines")
     ap.add_argument("--format", dest="fmt", default=r"{volume:.1f}mL\r\n",
                     help=r"streamed ASCII line; use {volume} and \r \n (default '{volume:.1f}mL\r\n')")
@@ -239,7 +284,9 @@ def main():
                 continue
             now = time.time()
             viz, volume, status = process_frame(
-                frame, detector, vol_history, args.capacity, want_viz=not args.no_window)
+                frame, detector, vol_history, args.capacity,
+                cone_frac=args.cone_frac, use_original_curve=args.original_curve,
+                want_viz=not args.no_window)
 
             # --- Stabilisation pipeline -------------------------------------
             # The median (done in process_frame over --smooth frames) already
