@@ -177,6 +177,38 @@ def test_legacy_cone_volume_model():
     assert abs(LL.calculate_volume_conical(0.4, C, 0.0) - 0.4 * C) < 1e-9
 
 
+def test_auto_cone_detection():
+    """The cone-start detector should recover the true cone fraction from the
+    tube silhouette (walls parallel in the cylinder, converging in the cone)."""
+    from cone_detect import detect_cone_fraction
+
+    def make_tube(true_frac, h=400, w=200, wall=180, bg=210, tip_gap=8):
+        img = np.full((h, w), bg, np.uint8)
+        cs = int(h * (1 - true_frac))          # row where cone begins
+        Lx, Rx = 60, 140
+        for y in range(h):
+            if y < cs:
+                l, r = Lx, Rx
+            else:
+                t = (y - cs) / (h - cs)
+                l = int(Lx + t * ((w // 2 - tip_gap // 2) - Lx))
+                r = int(Rx - t * (Rx - (w // 2 + tip_gap // 2)))
+            img[y, max(0, l - 1):l + 2] = wall
+            img[y, max(0, r - 1):r + 2] = wall
+        return cv2.GaussianBlur(img, (3, 3), 0)
+
+    for true_frac in (0.15, 0.25, 0.35):
+        est = detect_cone_fraction(make_tube(true_frac))
+        assert est is not None, f"no detection for {true_frac}"
+        assert abs(est - true_frac) < 0.05, f"true {true_frac} got {est}"
+    # A straight tube (no cone) should report ~0.
+    straight = np.full((400, 200), 210, np.uint8)
+    straight[:, 59:62] = 180
+    straight[:, 138:141] = 180
+    est = detect_cone_fraction(cv2.GaussianBlur(straight, (3, 3), 0))
+    assert est is not None and est < 0.05, f"straight tube got {est}"
+
+
 def test_linear_model():
     m = LinearModel(height_full_mm=100, capacity_ml=50)
     assert abs(m.volume(50) - 25) < 1e-6
