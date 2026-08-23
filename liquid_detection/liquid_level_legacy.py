@@ -36,7 +36,6 @@ import cv2
 
 from hardware import open_camera
 from aruco_compat import make_aruco_detector
-from cone_detect import detect_cone_fraction
 
 # --- Original detection settings (from the main-branch script) ---
 SMOOTHING_WINDOW = 15          # frames for median filtering of volume
@@ -59,41 +58,6 @@ def calculate_volume_from_height(height_pct, max_capacity):
     v_remaining_range = max_capacity - v_at_split
     height_above_split = height_pct - h_split
     return v_at_split + (height_above_split / h_remaining_range) * v_remaining_range
-
-
-def calculate_volume_conical(height_pct, max_capacity, cone_frac):
-    """
-    Cone + cylinder volume model for a conical-bottom tube.
-
-    The tube is modelled as a cone occupying the bottom ``cone_frac`` of the
-    measured height (radius growing linearly from the tip up to the tube bore),
-    topped by a straight cylinder. Because the cone is narrow near the tip, the
-    volume there grows with the CUBE of height -- far less per mm than the
-    cylinder -- which is exactly what the old piece-wise-linear curve got wrong.
-
-      * for h <= cone:   V = C/(3D) * h^3 / f^2         (cubic, the cone)
-      * for h  > cone:   V = C * (h - 2f/3) / D          (linear, the cylinder)
-      with f = cone_frac, D = (1 - 2f/3), h = height fraction (0..1), C = capacity.
-
-    cone_frac = 0 reduces to a straight linear fill. Both branches meet
-    continuously at h = f, and V(1) == max_capacity exactly.
-
-    Set cone_frac to (height of the conical section) / (height between the
-    bottom and top tag references). Measure it once with a ruler, or tune it so
-    the reading matches the tube's printed graduations near the bottom.
-    """
-    f = float(cone_frac)
-    if height_pct <= 0:
-        return 0.0
-    if height_pct >= 1:
-        return float(max_capacity)
-    if f <= 0:
-        return float(height_pct * max_capacity)
-    f = min(f, 0.99)
-    denom = 1.0 - (2.0 * f / 3.0)
-    if height_pct <= f:
-        return float(max_capacity / (3.0 * denom) * (height_pct ** 3) / (f * f))
-    return float(max_capacity * (height_pct - 2.0 * f / 3.0) / denom)
 
 
 def find_meniscus_gradient_mass(roi_gray):
@@ -137,9 +101,7 @@ def find_meniscus_gradient_mass(roi_gray):
     return best_y, grad_viz, max_score
 
 
-def process_frame(frame, detector, vol_history, tube_capacity,
-                  cone_frac=0.0, use_original_curve=False, measure_cone=False,
-                  want_viz=True):
+def process_frame(frame, detector, vol_history, tube_capacity, want_viz=True):
     """
     Original processing pipeline. Returns (viz_or_None, current_volume, status).
     """
@@ -174,16 +136,12 @@ def process_frame(frame, detector, vol_history, tube_capacity,
 
     meniscus_global_y = -1
     status = "Waiting for Tags..."
-    cone_measured = None
 
     if roi_defined:
         roi_gray = gray[roi_y1:roi_y2, roi_x1:roi_x2]
         if roi_gray.size > 0:
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             roi_enhanced = clahe.apply(roi_gray)
-            # Auto-detect where the conical bottom begins from the tube walls.
-            if measure_cone:
-                cone_measured = detect_cone_fraction(roi_enhanced)
             best_y_rel, _, gradient_score_val = find_meniscus_gradient_mass(roi_enhanced)
 
             if best_y_rel != -1:
@@ -209,10 +167,7 @@ def process_frame(frame, detector, vol_history, tube_capacity,
 
                 vol_history.append(pct)
                 pct = float(np.median(vol_history))
-                if use_original_curve:
-                    current_volume = calculate_volume_from_height(pct, tube_capacity)
-                else:
-                    current_volume = calculate_volume_conical(pct, tube_capacity, cone_frac)
+                current_volume = calculate_volume_from_height(pct, tube_capacity)
 
                 if want_viz:
                     cv2.line(view_result, (roi_x1 - 20, meniscus_global_y),
@@ -220,23 +175,13 @@ def process_frame(frame, detector, vol_history, tube_capacity,
                     label = f"{current_volume:.1f}ml ({(current_volume/tube_capacity)*100:.0f}%)"
                     cv2.putText(view_result, label, (roi_x2 + 15, meniscus_global_y),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-
-            # Subtle marker for where the conical bottom begins (thin dashed
-            # line, muted colour, small label -- just enough to see it).
-            if want_viz and not use_original_curve and 0.0 < cone_frac < 1.0:
-                cy = int(roi_y2 - cone_frac * (roi_y2 - roi_y1))
-                cone_col = (150, 170, 90)
-                for x in range(roi_x1, roi_x2, 12):
-                    cv2.line(view_result, (x, cy), (min(x + 6, roi_x2), cy), cone_col, 1)
-                cv2.putText(view_result, "cone", (roi_x1 + 2, cy - 4),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, cone_col, 1)
     else:
         status = "No Tags Found" if ids is None else "ROI Error"
 
     if want_viz:
         cv2.putText(view_result, status, (20, h - 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
-    return view_result, current_volume, status, cone_measured
+    return view_result, current_volume, status
 
 
 def main():
@@ -244,16 +189,6 @@ def main():
     ap.add_argument("--port", default=None, help="pump serial port, e.g. /dev/ttyUSB0")
     ap.add_argument("--baud", type=int, default=9600)
     ap.add_argument("--capacity", type=float, default=12.0, help="tube capacity in mL")
-    ap.add_argument("--cone-frac", type=float, default=0.15,
-                    help="fraction of the measured height taken by the conical "
-                         "bottom (cone height / distance between tags). Models the "
-                         "narrow tip so bottom readings are accurate. 0 = linear. "
-                         "Used as the starting value; auto-detect overrides it "
-                         "unless --no-auto-cone is set.")
-    ap.add_argument("--no-auto-cone", action="store_true",
-                    help="disable automatic cone-start detection from the tube walls")
-    ap.add_argument("--original-curve", action="store_true",
-                    help="use the old 2/15 piece-wise curve instead of the cone model")
     ap.add_argument("--interval", type=float, default=0.5, help="seconds between streamed lines")
     ap.add_argument("--format", dest="fmt", default=r"{volume:.1f}mL\r\n",
                     help=r"streamed ASCII line; use {volume} and \r \n (default '{volume:.1f}mL\r\n')")
@@ -295,22 +230,6 @@ def main():
     last_print = 0.0
     ema_vol = None        # smoothed value
     held_vol = None       # deadbanded value that is actually shown/sent
-
-    # Live-tunable calibration (adjustable from the window with the keys below).
-    capacity = args.capacity
-    cone_frac = args.cone_frac
-    auto_cone = not args.no_auto_cone and not args.original_curve
-    cone_samples = deque(maxlen=30)     # recent auto-detected cone fractions
-
-    if not args.no_window:
-        print("\nLIVE TUNING (in the window):")
-        print("  ] / [   capacity  +/- 0.5 mL")
-        print("  = / -   cone-frac +/- 0.01  (also turns OFF auto-cone)")
-        print("  a       re-enable automatic cone-start detection")
-        print("  p       print current values to paste into your command")
-        print("  q       quit")
-    if auto_cone:
-        print("[cone] auto-detecting the conical bottom from the tube walls...")
     print("\nSystem ready. Ctrl-C (headless) or 'q' (window) to quit.")
 
     try:
@@ -319,16 +238,8 @@ def main():
             if frame is None:
                 continue
             now = time.time()
-            viz, volume, status, cone_measured = process_frame(
-                frame, detector, vol_history, capacity,
-                cone_frac=cone_frac, use_original_curve=args.original_curve,
-                measure_cone=auto_cone, want_viz=not args.no_window)
-
-            # Fold in the auto-detected cone start (median over recent frames).
-            if auto_cone and cone_measured is not None:
-                cone_samples.append(cone_measured)
-                if len(cone_samples) >= 5:
-                    cone_frac = round(float(np.median(cone_samples)), 3)
+            viz, volume, status = process_frame(
+                frame, detector, vol_history, args.capacity, want_viz=not args.no_window)
 
             # --- Stabilisation pipeline -------------------------------------
             # The median (done in process_frame over --smooth frames) already
@@ -356,41 +267,12 @@ def main():
                 if viz is not None:
                     cv2.putText(viz, f"{out_vol:.1f} mL (stable)", (20, 40),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-                    # Calibration HUD.
-                    if args.original_curve:
-                        curve = "curve original"
-                    else:
-                        tag = "auto" if auto_cone else "manual"
-                        curve = f"cone {cone_frac:.2f} ({tag})"
-                    cv2.putText(viz, f"capacity {capacity:.1f} mL  |  {curve}",
-                                (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                    cv2.putText(viz, "[ ] capacity   - = cone   a auto   p print   q quit",
-                                (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
                     cv2.imshow(window, viz)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
+                if (cv2.waitKey(1) & 0xFF) == ord('q'):
                     break
-                elif key == ord(']'):
-                    capacity = round(capacity + 0.5, 2); ema_vol = held_vol = None
-                elif key == ord('['):
-                    capacity = round(max(0.5, capacity - 0.5), 2); ema_vol = held_vol = None
-                elif key == ord('='):   # '+' without shift -> manual cone override
-                    auto_cone = False
-                    cone_frac = round(min(0.9, cone_frac + 0.01), 3); ema_vol = held_vol = None
-                elif key == ord('-'):
-                    auto_cone = False
-                    cone_frac = round(max(0.0, cone_frac - 0.01), 3); ema_vol = held_vol = None
-                elif key == ord('a'):   # re-enable auto cone detection
-                    auto_cone = not args.original_curve
-                    cone_samples.clear(); ema_vol = held_vol = None
-                    print("[cone] auto-detection re-enabled")
-                elif key == ord('p'):
-                    mode = "(auto)" if auto_cone else "(manual)"
-                    print(f"[tune] --capacity {capacity:g} --cone-frac {cone_frac:g} {mode}", flush=True)
             else:
                 if now - last_print >= 0.5:
-                    cone_txt = "" if args.original_curve else f"  cone={cone_frac:.2f}{'(auto)' if auto_cone else ''}"
-                    print(f"[level] {out_vol:5.1f} mL   (raw {volume:5.1f})   {status}{cone_txt}",
+                    print(f"[level] {out_vol:5.1f} mL   (raw {volume:5.1f})   {status}",
                           flush=True)
                     last_print = now
     except KeyboardInterrupt:
@@ -400,9 +282,6 @@ def main():
         if serial_port:
             serial_port.close()
         cv2.destroyAllWindows()
-        # Remind the user of the final calibration so they can bake it in.
-        if not args.original_curve:
-            print(f"\n[tune] final calibration:  --capacity {capacity:g} --cone-frac {cone_frac:g}")
 
 
 if __name__ == "__main__":
