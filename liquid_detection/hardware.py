@@ -48,8 +48,15 @@ class Camera:
 
     def read(self) -> Optional[np.ndarray]:
         if self.picam2 is not None:
-            rgb = self.picam2.capture_array()
-            return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            arr = self.picam2.capture_array()
+            # Picamera2's "RGB888" already stores channels in B,G,R order --
+            # exactly what OpenCV treats as BGR -- so DO NOT colour-convert.
+            # Converting here swaps red/blue (blue-tinted image) and, because the
+            # grayscale for AprilTag detection is derived from these channels,
+            # also hurts tag detection.
+            if arr.ndim == 3 and arr.shape[2] == 4:
+                arr = arr[:, :, :3]     # drop alpha if an XRGB format sneaks in
+            return arr
         ok, frame = self.cap.read()
         return frame if ok else None
 
