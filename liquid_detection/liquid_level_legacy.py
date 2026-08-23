@@ -41,11 +41,6 @@ from aruco_compat import make_aruco_detector
 SMOOTHING_WINDOW = 15          # frames for median filtering of volume
 GRADIENT_FILTER_WIDTH = 0.80   # a line must span >= this fraction of the width
 GRADIENT_SUM_WIDTH = 0.20      # measure the middle this fraction of the tube
-ROI_HOLD_FRAMES = 90           # keep the last tag ROI this long through dropouts
-
-# CLAHE used ONLY to contrast-normalise the frame for tag detection (rescues
-# backlit / washed-out tags); the meniscus stage keeps the untouched grayscale.
-_DET_CLAHE = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 
 
 def calculate_volume_from_height(height_pct, max_capacity):
@@ -63,6 +58,35 @@ def calculate_volume_from_height(height_pct, max_capacity):
     v_remaining_range = max_capacity - v_at_split
     height_above_split = height_pct - h_split
     return v_at_split + (height_above_split / h_remaining_range) * v_remaining_range
+
+
+def calculate_volume_conical(height_pct, max_capacity, cone_frac):
+    """
+    Cone + cylinder volume model for a conical-bottom tube.
+
+    The bottom ``cone_frac`` of the measured height is a cone (radius growing
+    linearly from the tip), topped by a straight cylinder. The cone is narrow
+    near the tip, so its volume grows with the CUBE of height -- far less per mm
+    than the cylinder -- which is what makes bottom-of-tube readings accurate.
+
+      * for h <= cone:  V = C/(3D) * h^3 / f^2   (cubic)
+      * for h  > cone:  V = C * (h - 2f/3) / D    (linear)
+      f = cone_frac, D = 1 - 2f/3, h = height fraction (0..1), C = capacity.
+
+    cone_frac = 0 reduces to a straight linear fill; V(1) == max_capacity.
+    """
+    f = float(cone_frac)
+    if height_pct <= 0:
+        return 0.0
+    if height_pct >= 1:
+        return float(max_capacity)
+    if f <= 0:
+        return float(height_pct * max_capacity)
+    f = min(f, 0.99)
+    denom = 1.0 - (2.0 * f / 3.0)
+    if height_pct <= f:
+        return float(max_capacity / (3.0 * denom) * (height_pct ** 3) / (f * f))
+    return float(max_capacity * (height_pct - 2.0 * f / 3.0) / denom)
 
 
 def find_meniscus_gradient_mass(roi_gray):
@@ -106,19 +130,16 @@ def find_meniscus_gradient_mass(roi_gray):
     return best_y, grad_viz, max_score
 
 
-def process_frame(frame, detector, vol_history, tube_capacity, want_viz=True,
-                  roi_cache=None):
+def process_frame(frame, detector, vol_history, tube_capacity,
+                  cone_frac=0.0, use_original_curve=False, want_viz=True):
     """
     Original processing pipeline. Returns (viz_or_None, current_volume, status).
     """
     h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    # Contrast-normalise a COPY just for tag detection (backlit tags decode much
-    # better); keep the untouched `gray` for the meniscus stage.
-    gray_det = _DET_CLAHE.apply(gray)
     current_volume = 0.0
 
-    corners, ids, _ = detector.detectMarkers(gray_det)
+    corners, ids, _ = detector.detectMarkers(gray)
     detected_tags = []
     roi_defined = False
     view_result = frame.copy() if want_viz else None
@@ -140,24 +161,8 @@ def process_frame(frame, detector, vol_history, tube_capacity, want_viz=True,
         roi_x2 = bottom_tag['bbox_x'] + bottom_tag['bbox_w']
         if roi_y2 > roi_y1 + 10 and roi_x2 > roi_x1 + 10:
             roi_defined = True
-
-    # Tag-position persistence: the tags are fixed to the holder, so once the
-    # ROI is found, hold it through brief single-tag dropouts (backlight, glare)
-    # instead of flashing "ROI Error".
-    held = False
-    if roi_cache is not None:
-        if roi_defined:
-            roi_cache['roi'] = (roi_x1, roi_y1, roi_x2, roi_y2)
-            roi_cache['age'] = 0
-        elif roi_cache.get('roi') is not None and roi_cache.get('age', 999) < ROI_HOLD_FRAMES:
-            roi_x1, roi_y1, roi_x2, roi_y2 = roi_cache['roi']
-            roi_cache['age'] = roi_cache.get('age', 0) + 1
-            roi_defined = True
-            held = True
-
-    if roi_defined and want_viz:
-        col = (0, 180, 255) if held else (0, 255, 255)
-        cv2.rectangle(view_result, (roi_x1, roi_y1), (roi_x2, roi_y2), col, 2)
+            if want_viz:
+                cv2.rectangle(view_result, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 255, 255), 2)
 
     meniscus_global_y = -1
     status = "Waiting for Tags..."
@@ -192,7 +197,10 @@ def process_frame(frame, detector, vol_history, tube_capacity, want_viz=True,
 
                 vol_history.append(pct)
                 pct = float(np.median(vol_history))
-                current_volume = calculate_volume_from_height(pct, tube_capacity)
+                if use_original_curve:
+                    current_volume = calculate_volume_from_height(pct, tube_capacity)
+                else:
+                    current_volume = calculate_volume_conical(pct, tube_capacity, cone_frac)
 
                 if want_viz:
                     cv2.line(view_result, (roi_x1 - 20, meniscus_global_y),
@@ -214,6 +222,12 @@ def main():
     ap.add_argument("--port", default=None, help="pump serial port, e.g. /dev/ttyUSB0")
     ap.add_argument("--baud", type=int, default=9600)
     ap.add_argument("--capacity", type=float, default=12.0, help="tube capacity in mL")
+    ap.add_argument("--cone-frac", type=float, default=0.15,
+                    help="fraction of the measured height taken by the conical "
+                         "bottom (cone height / distance between the two tags). "
+                         "Makes bottom-of-tube volumes accurate. 0 = linear.")
+    ap.add_argument("--original-curve", action="store_true",
+                    help="use the old 2/15 piece-wise curve instead of the cone model")
     ap.add_argument("--interval", type=float, default=0.5, help="seconds between streamed lines")
     ap.add_argument("--format", dest="fmt", default=r"{volume:.1f}mL\r\n",
                     help=r"streamed ASCII line; use {volume} and \r \n (default '{volume:.1f}mL\r\n')")
@@ -255,7 +269,6 @@ def main():
     last_print = 0.0
     ema_vol = None        # smoothed value
     held_vol = None       # deadbanded value that is actually shown/sent
-    roi_cache = {}        # remembers the last good tag ROI through dropouts
     print("\nSystem ready. Ctrl-C (headless) or 'q' (window) to quit.")
 
     try:
@@ -266,7 +279,8 @@ def main():
             now = time.time()
             viz, volume, status = process_frame(
                 frame, detector, vol_history, args.capacity,
-                want_viz=not args.no_window, roi_cache=roi_cache)
+                cone_frac=args.cone_frac, use_original_curve=args.original_curve,
+                want_viz=not args.no_window)
 
             # --- Stabilisation pipeline -------------------------------------
             # The median (done in process_frame over --smooth frames) already

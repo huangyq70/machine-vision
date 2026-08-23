@@ -156,6 +156,22 @@ def test_geometric_cone_monotonic_and_nonlinear():
     assert abs(tube.volume(h) - 10) < 0.05
 
 
+def test_legacy_cone_volume_model():
+    """The legacy cone+cylinder curve: exact endpoints, continuous, monotonic,
+    and holds far less near the narrow tip than a linear fill."""
+    import liquid_level_legacy as LL
+    C, f = 50.0, 0.15
+    V = lambda p: LL.calculate_volume_conical(p, C, f)
+    assert abs(V(0.0)) < 1e-9
+    assert abs(V(1.0) - C) < 1e-9
+    assert abs(V(f - 1e-6) - V(f + 1e-6)) < 1e-3          # continuity at the join
+    vs = [V(i / 200) for i in range(201)]
+    assert all(b >= a - 1e-9 for a, b in zip(vs, vs[1:]))  # monotonic
+    assert V(f) < f * C                                    # cone holds less
+    assert (V(0.05) - V(0.0)) < (V(1.0) - V(0.95))         # slower at the bottom
+    assert abs(LL.calculate_volume_conical(0.4, C, 0.0) - 0.4 * C) < 1e-9  # 0 = linear
+
+
 def test_linear_model():
     m = LinearModel(height_full_mm=100, capacity_ml=50)
     assert abs(m.volume(50) - 25) < 1e-6
