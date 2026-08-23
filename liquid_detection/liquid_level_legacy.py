@@ -41,6 +41,7 @@ from aruco_compat import make_aruco_detector
 SMOOTHING_WINDOW = 15          # frames for median filtering of volume
 GRADIENT_FILTER_WIDTH = 0.80   # a line must span >= this fraction of the width
 GRADIENT_SUM_WIDTH = 0.20      # measure the middle this fraction of the tube
+CONE_MIN_SCORE = 2.6           # min prominence for a cone-region surface
 
 
 def calculate_volume_from_height(height_pct, max_capacity):
@@ -130,14 +131,69 @@ def find_meniscus_gradient_mass(roi_gray):
     return best_y, grad_viz, max_score
 
 
-def process_frame(frame, detector, vol_history, tube_capacity,
-                  cone_frac=0.0, use_original_curve=False, want_viz=True):
+def detect_cone_meniscus(roi_enhanced, cone_zone):
     """
-    Original processing pipeline. Returns (viz_or_None, current_volume, status).
+    Find the liquid surface inside the narrow conical bottom.
+
+    The main gradient detector needs a line spanning ~80% of the ROI width, but
+    in the cone the tube (and the surface) is much narrower, so that fails. Here
+    we look only at a central vertical strip -- the surface crosses the centre
+    no matter how narrow the cone gets -- and find the strongest horizontal
+    brightness step within the bottom ``cone_zone`` of the ROI.
+
+    Returns (surface_row_in_roi, prominence_score) or (-1, 0.0).
+    """
+    h, w = roi_enhanced.shape
+    ch = max(8, int(h * cone_zone))
+    y0 = h - ch
+    cone = roi_enhanced[y0:h, :]
+    cw = max(4, int(w * 0.34))
+    x0 = (w - cw) // 2
+    strip = cone[:, x0:x0 + cw].astype(np.float64)
+    strip = cv2.GaussianBlur(strip, (5, 1), 0)          # smooth across the strip
+    prof = strip.mean(axis=1)
+    prof = cv2.GaussianBlur(prof.reshape(-1, 1), (1, 5), 0).ravel()
+    grad = np.abs(np.gradient(prof))
+    m = max(1, int(ch * 0.08))                          # ignore very top/bottom
+    grad[:m] = 0
+    grad[len(grad) - m:] = 0
+    if grad.max() < 1e-6:
+        return -1, 0.0
+    best = int(np.argmax(grad))
+    base = np.median(grad[grad > 0]) if np.any(grad > 0) else 1.0
+    score = float(grad[best] / (base + 1e-6))
+    return y0 + best, score
+
+
+def build_cone_zoom(color_roi, cone_zone, target_h, surface_rel=None):
+    """A magnified panel of the bottom (cone) region of the tube for display."""
+    h, w = color_roi.shape[:2]
+    ch = max(8, int(h * cone_zone))
+    y0 = h - ch
+    cone = color_roi[y0:h, :].copy()
+    if cone.size == 0:
+        return None
+    scale = target_h / cone.shape[0]
+    new_w = int(min(240, max(70, cone.shape[1] * scale)))   # cap the panel width
+    panel = cv2.resize(cone, (new_w, target_h), interpolation=cv2.INTER_LINEAR)
+    if surface_rel is not None and surface_rel >= y0:
+        py = int((surface_rel - y0) * scale)
+        cv2.line(panel, (0, py), (new_w, py), (0, 255, 0), 2)
+    cv2.putText(panel, "CONE", (5, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    return panel
+
+
+def process_frame(frame, detector, vol_history, tube_capacity,
+                  cone_frac=0.0, use_original_curve=False,
+                  cone_zone=0.28, cone_detect=True, want_viz=True):
+    """
+    Original processing pipeline.
+    Returns (viz_or_None, current_volume, status, cone_zoom_panel_or_None).
     """
     h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     current_volume = 0.0
+    cone_zoom = None
 
     corners, ids, _ = detector.detectMarkers(gray)
     detected_tags = []
@@ -174,17 +230,25 @@ def process_frame(frame, detector, vol_history, tube_capacity,
             roi_enhanced = clahe.apply(roi_gray)
             best_y_rel, _, gradient_score_val = find_meniscus_gradient_mass(roi_enhanced)
 
-            if best_y_rel != -1:
-                if gradient_score_val < 5000 * GRADIENT_SUM_WIDTH:
-                    meniscus_global_y = roi_y2
-                    status = f"Empty (Grad {int(gradient_score_val)})"
+            # Main (wide-span) detection.
+            meniscus_rel = -1
+            if best_y_rel != -1 and gradient_score_val >= 5000 * GRADIENT_SUM_WIDTH:
+                meniscus_rel = best_y_rel
+                status = "Locked (Gradient)"
+            elif cone_detect:
+                # Wide-span found nothing -> the surface is likely low, in the
+                # narrow cone. Use the cone-focused (central-strip) detector.
+                cone_rel, cone_score = detect_cone_meniscus(roi_enhanced, cone_zone)
+                if cone_rel != -1 and cone_score >= CONE_MIN_SCORE:
+                    meniscus_rel = cone_rel
+                    status = "Locked (Cone)"
                 else:
-                    meniscus_global_y = roi_y1 + best_y_rel
-                    status = "Locked (Gradient)"
+                    status = "Empty"
             else:
-                status = "No Strong Edge"
+                status = ("Empty" if best_y_rel != -1 else "No Strong Edge")
 
-            if meniscus_global_y != -1:
+            if meniscus_rel != -1:
+                meniscus_global_y = roi_y1 + meniscus_rel
                 total_h = roi_y2 - roi_y1
                 liquid_h = roi_y2 - meniscus_global_y
                 pct = max(0.0, min(1.0, liquid_h / total_h))
@@ -208,13 +272,22 @@ def process_frame(frame, detector, vol_history, tube_capacity,
                     label = f"{current_volume:.1f}ml ({(current_volume/tube_capacity)*100:.0f}%)"
                     cv2.putText(view_result, label, (roi_x2 + 15, meniscus_global_y),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            else:
+                meniscus_global_y = roi_y2
+
+            # Zoomed cone panel (shows the liquid in the narrow bottom).
+            if want_viz:
+                cone_zoom = build_cone_zoom(
+                    frame[roi_y1:roi_y2, roi_x1:roi_x2], cone_zone,
+                    view_result.shape[0],
+                    surface_rel=(meniscus_rel if meniscus_rel != -1 else None))
     else:
         status = "No Tags Found" if ids is None else "ROI Error"
 
     if want_viz:
         cv2.putText(view_result, status, (20, h - 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
-    return view_result, current_volume, status
+    return view_result, current_volume, status, cone_zoom
 
 
 def main():
@@ -228,6 +301,11 @@ def main():
                          "Makes bottom-of-tube volumes accurate. 0 = linear.")
     ap.add_argument("--original-curve", action="store_true",
                     help="use the old 2/15 piece-wise curve instead of the cone model")
+    ap.add_argument("--cone-zone", type=float, default=0.28,
+                    help="bottom fraction of the tube treated as the cone: shown "
+                         "in the zoom panel and where cone-focused detection runs")
+    ap.add_argument("--no-cone-detect", action="store_true",
+                    help="disable the cone-focused detector (only wide-span)")
     ap.add_argument("--interval", type=float, default=0.5, help="seconds between streamed lines")
     ap.add_argument("--format", dest="fmt", default=r"{volume:.1f}mL\r\n",
                     help=r"streamed ASCII line; use {volume} and \r \n (default '{volume:.1f}mL\r\n')")
@@ -277,9 +355,10 @@ def main():
             if frame is None:
                 continue
             now = time.time()
-            viz, volume, status = process_frame(
+            viz, volume, status, cone_zoom = process_frame(
                 frame, detector, vol_history, args.capacity,
                 cone_frac=args.cone_frac, use_original_curve=args.original_curve,
+                cone_zone=args.cone_zone, cone_detect=not args.no_cone_detect,
                 want_viz=not args.no_window)
 
             # --- Stabilisation pipeline -------------------------------------
@@ -308,7 +387,12 @@ def main():
                 if viz is not None:
                     cv2.putText(viz, f"{out_vol:.1f} mL (stable)", (20, 40),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-                    cv2.imshow(window, viz)
+                    # Show the zoomed cone panel alongside the main view.
+                    if cone_zoom is not None and cone_zoom.shape[0] == viz.shape[0]:
+                        display = np.hstack([viz, cone_zoom])
+                    else:
+                        display = viz
+                    cv2.imshow(window, display)
                 if (cv2.waitKey(1) & 0xFF) == ord('q'):
                     break
             else:
