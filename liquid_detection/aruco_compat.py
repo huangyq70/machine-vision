@@ -35,6 +35,24 @@ def _make_params():
         params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
     except Exception:
         pass
+
+    # Robustness tuning: a wide adaptive-threshold window range copes with
+    # uneven lighting / backlit tags, and a low min perimeter lets smaller or
+    # farther tags still be found. Each guarded so it is a no-op on odd builds.
+    for attr, val in (
+        ("adaptiveThreshWinSizeMin", 3),
+        ("adaptiveThreshWinSizeMax", 45),
+        ("adaptiveThreshWinSizeStep", 6),
+        ("adaptiveThreshConstant", 7),
+        ("minMarkerPerimeterRate", 0.02),
+        ("maxMarkerPerimeterRate", 4.0),
+        ("polygonalApproxAccuracyRate", 0.06),
+        ("minCornerDistanceRate", 0.03),
+    ):
+        try:
+            setattr(params, attr, val)
+        except Exception:
+            pass
     return params
 
 

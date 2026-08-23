@@ -41,6 +41,11 @@ from aruco_compat import make_aruco_detector
 SMOOTHING_WINDOW = 15          # frames for median filtering of volume
 GRADIENT_FILTER_WIDTH = 0.80   # a line must span >= this fraction of the width
 GRADIENT_SUM_WIDTH = 0.20      # measure the middle this fraction of the tube
+ROI_HOLD_FRAMES = 90           # keep the last tag ROI this long through dropouts
+
+# CLAHE used ONLY to contrast-normalise the frame for tag detection (rescues
+# backlit / washed-out tags); the meniscus stage keeps the untouched grayscale.
+_DET_CLAHE = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 
 
 def calculate_volume_from_height(height_pct, max_capacity):
@@ -101,15 +106,19 @@ def find_meniscus_gradient_mass(roi_gray):
     return best_y, grad_viz, max_score
 
 
-def process_frame(frame, detector, vol_history, tube_capacity, want_viz=True):
+def process_frame(frame, detector, vol_history, tube_capacity, want_viz=True,
+                  roi_cache=None):
     """
     Original processing pipeline. Returns (viz_or_None, current_volume, status).
     """
     h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # Contrast-normalise a COPY just for tag detection (backlit tags decode much
+    # better); keep the untouched `gray` for the meniscus stage.
+    gray_det = _DET_CLAHE.apply(gray)
     current_volume = 0.0
 
-    corners, ids, _ = detector.detectMarkers(gray)
+    corners, ids, _ = detector.detectMarkers(gray_det)
     detected_tags = []
     roi_defined = False
     view_result = frame.copy() if want_viz else None
@@ -131,8 +140,24 @@ def process_frame(frame, detector, vol_history, tube_capacity, want_viz=True):
         roi_x2 = bottom_tag['bbox_x'] + bottom_tag['bbox_w']
         if roi_y2 > roi_y1 + 10 and roi_x2 > roi_x1 + 10:
             roi_defined = True
-            if want_viz:
-                cv2.rectangle(view_result, (roi_x1, roi_y1), (roi_x2, roi_y2), (0, 255, 255), 2)
+
+    # Tag-position persistence: the tags are fixed to the holder, so once the
+    # ROI is found, hold it through brief single-tag dropouts (backlight, glare)
+    # instead of flashing "ROI Error".
+    held = False
+    if roi_cache is not None:
+        if roi_defined:
+            roi_cache['roi'] = (roi_x1, roi_y1, roi_x2, roi_y2)
+            roi_cache['age'] = 0
+        elif roi_cache.get('roi') is not None and roi_cache.get('age', 999) < ROI_HOLD_FRAMES:
+            roi_x1, roi_y1, roi_x2, roi_y2 = roi_cache['roi']
+            roi_cache['age'] = roi_cache.get('age', 0) + 1
+            roi_defined = True
+            held = True
+
+    if roi_defined and want_viz:
+        col = (0, 180, 255) if held else (0, 255, 255)
+        cv2.rectangle(view_result, (roi_x1, roi_y1), (roi_x2, roi_y2), col, 2)
 
     meniscus_global_y = -1
     status = "Waiting for Tags..."
@@ -230,6 +255,7 @@ def main():
     last_print = 0.0
     ema_vol = None        # smoothed value
     held_vol = None       # deadbanded value that is actually shown/sent
+    roi_cache = {}        # remembers the last good tag ROI through dropouts
     print("\nSystem ready. Ctrl-C (headless) or 'q' (window) to quit.")
 
     try:
@@ -239,7 +265,8 @@ def main():
                 continue
             now = time.time()
             viz, volume, status = process_frame(
-                frame, detector, vol_history, args.capacity, want_viz=not args.no_window)
+                frame, detector, vol_history, args.capacity,
+                want_viz=not args.no_window, roi_cache=roi_cache)
 
             # --- Stabilisation pipeline -------------------------------------
             # The median (done in process_frame over --smooth frames) already
