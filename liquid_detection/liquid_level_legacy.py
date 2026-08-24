@@ -197,15 +197,20 @@ def build_cone_zoom(color_roi, cone_zone, target_h, surface_rel=None):
 def process_frame(frame, detector, vol_history, tube_capacity,
                   cone_frac=0.0, use_original_curve=False,
                   cone_zone=0.28, cone_detect=True, detector_mode="gradient",
-                  want_viz=True):
+                  empty_pct=0.0, full_pct=1.0, want_viz=True):
     """
     Original processing pipeline.
-    Returns (viz_or_None, current_volume, status, cone_zoom_panel_or_None).
+    Returns (viz, current_volume, status, cone_zoom_panel_or_None, raw_pct).
+
+    empty_pct/full_pct are the ROI fractions (0 = bottom tag, 1 = top tag) that
+    correspond to the tube's 0 mL and full marks. They calibrate away the fact
+    that the tags aren't at the tube's zero/full lines. Default 0/1 = no cal.
     """
     h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     current_volume = 0.0
     cone_zoom = None
+    raw_pct = 0.0
 
     corners, ids, _ = detector.detectMarkers(gray)
     detected_tags = []
@@ -285,10 +290,15 @@ def process_frame(frame, detector, vol_history, tube_capacity,
 
                 vol_history.append(pct)
                 pct = float(np.median(vol_history))
+                raw_pct = pct
+                # Map ROI fraction -> true tube fraction using the calibration
+                # anchors, then apply the volume curve.
+                span = full_pct - empty_pct
+                tube_pct = pct if span <= 1e-6 else max(0.0, min(1.0, (pct - empty_pct) / span))
                 if use_original_curve:
-                    current_volume = calculate_volume_from_height(pct, tube_capacity)
+                    current_volume = calculate_volume_from_height(tube_pct, tube_capacity)
                 else:
-                    current_volume = calculate_volume_conical(pct, tube_capacity, cone_frac)
+                    current_volume = calculate_volume_conical(tube_pct, tube_capacity, cone_frac)
 
                 if want_viz:
                     cv2.line(view_result, (roi_x1 - 20, meniscus_global_y),
@@ -311,7 +321,7 @@ def process_frame(frame, detector, vol_history, tube_capacity,
     if want_viz:
         cv2.putText(view_result, status, (20, h - 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
-    return view_result, current_volume, status, cone_zoom
+    return view_result, current_volume, status, cone_zoom, raw_pct
 
 
 def main():
@@ -333,6 +343,11 @@ def main():
     ap.add_argument("--detector", choices=["gradient", "multicue"], default="gradient",
                     help="meniscus finder: 'gradient' (original) or 'multicue' "
                          "(rejects graduation marks -- use for graduated / clear tubes)")
+    ap.add_argument("--empty-pct", type=float, default=0.0,
+                    help="ROI fraction (0=bottom tag..1=top tag) that reads 0 mL; "
+                         "set live with 'z'. Corrects the tube's zero offset.")
+    ap.add_argument("--full-pct", type=float, default=1.0,
+                    help="ROI fraction that reads `capacity` mL; set live with 'f'.")
     ap.add_argument("--interval", type=float, default=0.5, help="seconds between streamed lines")
     ap.add_argument("--format", dest="fmt", default=r"{volume:.1f}mL\r\n",
                     help=r"streamed ASCII line; use {volume} and \r \n (default '{volume:.1f}mL\r\n')")
@@ -374,6 +389,12 @@ def main():
     last_print = 0.0
     ema_vol = None        # smoothed value
     held_vol = None       # deadbanded value that is actually shown/sent
+    empty_pct = args.empty_pct   # ROI fraction that is 0 mL (live-calibratable)
+    full_pct = args.full_pct     # ROI fraction that is `capacity` mL
+    last_pct = 0.0
+    if not args.no_window:
+        print("\nCALIBRATION (in the window): fill to the tube's 0 mark and press "
+              "'z'; fill to the full/capacity mark and press 'f'. 'p' prints values.")
     print("\nSystem ready. Ctrl-C (headless) or 'q' (window) to quit.")
 
     try:
@@ -382,11 +403,12 @@ def main():
             if frame is None:
                 continue
             now = time.time()
-            viz, volume, status, cone_zoom = process_frame(
+            viz, volume, status, cone_zoom, last_pct = process_frame(
                 frame, detector, vol_history, args.capacity,
                 cone_frac=args.cone_frac, use_original_curve=args.original_curve,
                 cone_zone=args.cone_zone, cone_detect=not args.no_cone_detect,
-                detector_mode=args.detector, want_viz=not args.no_window)
+                detector_mode=args.detector, empty_pct=empty_pct, full_pct=full_pct,
+                want_viz=not args.no_window)
 
             # --- Stabilisation pipeline -------------------------------------
             # The median (done in process_frame over --smooth frames) already
@@ -414,14 +436,27 @@ def main():
                 if viz is not None:
                     cv2.putText(viz, f"{out_vol:.1f} mL (stable)", (20, 40),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                    cv2.putText(viz, f"pos {last_pct*100:4.0f}%  cal[0mL={empty_pct*100:.0f}%"
+                                f" full={full_pct*100:.0f}%]  z/f=set p=print",
+                                (20, viz.shape[0] - 60), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6, (0, 255, 255), 2)
                     # Show the zoomed cone panel alongside the main view.
                     if cone_zoom is not None and cone_zoom.shape[0] == viz.shape[0]:
                         display = np.hstack([viz, cone_zoom])
                     else:
                         display = viz
                     cv2.imshow(window, display)
-                if (cv2.waitKey(1) & 0xFF) == ord('q'):
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
                     break
+                elif key == ord('z'):
+                    empty_pct = last_pct
+                    print(f"[cal] 0 mL set at pos {empty_pct*100:.1f}%")
+                elif key == ord('f'):
+                    full_pct = last_pct
+                    print(f"[cal] full ({args.capacity:g} mL) set at pos {full_pct*100:.1f}%")
+                elif key == ord('p'):
+                    print(f"[cal] --empty-pct {empty_pct:.4f} --full-pct {full_pct:.4f}")
             else:
                 if now - last_print >= 0.5:
                     print(f"[level] {out_vol:5.1f} mL   (raw {volume:5.1f})   {status}",
@@ -434,6 +469,9 @@ def main():
         if serial_port:
             serial_port.close()
         cv2.destroyAllWindows()
+        if (empty_pct, full_pct) != (0.0, 1.0):
+            print(f"\n[cal] final calibration:  --empty-pct {empty_pct:.4f} "
+                  f"--full-pct {full_pct:.4f}  (add to your command / tanda_launch.sh)")
 
 
 if __name__ == "__main__":
