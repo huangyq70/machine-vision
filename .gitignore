@@ -3,3 +3,4 @@ images/
 templates/
 __pycache__/
 *.pyc
+liquid_detection/tube_settings.json

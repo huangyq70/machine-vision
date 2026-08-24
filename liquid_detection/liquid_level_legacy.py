@@ -28,6 +28,8 @@ Add a window (needs a display) by dropping --no-window.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import time
 from collections import deque
 
@@ -47,6 +49,40 @@ def _multicue():
     if _MULTICUE is None:
         _MULTICUE = MeniscusDetector(MeniscusConfig())
     return _MULTICUE
+
+
+# Default settings file lives next to this script so the desktop app finds it.
+DEFAULT_SETTINGS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "tube_settings.json")
+
+
+def load_settings(path):
+    if path and os.path.exists(path):
+        try:
+            with open(path) as fh:
+                return json.load(fh)
+        except Exception:
+            pass
+    return {}
+
+
+def save_settings(path, data):
+    if not path:
+        return
+    try:
+        with open(path, "w") as fh:
+            json.dump(data, fh, indent=2)
+    except Exception as e:  # noqa: BLE001
+        print(f"[settings] could not save {path}: {e}")
+
+
+def _pick(cli, saved, default):
+    """CLI value wins if given (not None); else saved; else the default."""
+    if cli is not None:
+        return cli
+    if saved is not None:
+        return saved
+    return default
 
 # --- Original detection settings (from the main-branch script) ---
 SMOOTHING_WINDOW = 15          # frames for median filtering of volume
@@ -328,8 +364,13 @@ def main():
     ap = argparse.ArgumentParser(description="Original gradient detection + streaming pump comms")
     ap.add_argument("--port", default=None, help="pump serial port, e.g. /dev/ttyUSB0")
     ap.add_argument("--baud", type=int, default=9600)
-    ap.add_argument("--capacity", type=float, default=12.0, help="tube capacity in mL")
-    ap.add_argument("--cone-frac", type=float, default=0.15,
+    ap.add_argument("--capacity", type=float, default=None, help="tube capacity in mL")
+    ap.add_argument("--ask", action="store_true",
+                    help="prompt for the tube capacity at startup")
+    ap.add_argument("--settings", default=DEFAULT_SETTINGS,
+                    help="JSON file to remember capacity + calibration (use "
+                         "'none' to disable)")
+    ap.add_argument("--cone-frac", type=float, default=None,
                     help="fraction of the measured height taken by the conical "
                          "bottom (cone height / distance between the two tags). "
                          "Makes bottom-of-tube volumes accurate. 0 = linear.")
@@ -343,10 +384,10 @@ def main():
     ap.add_argument("--detector", choices=["gradient", "multicue"], default="gradient",
                     help="meniscus finder: 'gradient' (original) or 'multicue' "
                          "(rejects graduation marks -- use for graduated / clear tubes)")
-    ap.add_argument("--empty-pct", type=float, default=0.0,
+    ap.add_argument("--empty-pct", type=float, default=None,
                     help="ROI fraction (0=bottom tag..1=top tag) that reads 0 mL; "
                          "set live with 'z'. Corrects the tube's zero offset.")
-    ap.add_argument("--full-pct", type=float, default=1.0,
+    ap.add_argument("--full-pct", type=float, default=None,
                     help="ROI fraction that reads `capacity` mL; set live with 'f'.")
     ap.add_argument("--interval", type=float, default=0.5, help="seconds between streamed lines")
     ap.add_argument("--format", dest="fmt", default=r"{volume:.1f}mL\r\n",
@@ -362,6 +403,29 @@ def main():
                     help="mL; the shown/sent value only moves when it changes by "
                          "more than this (holds steady when the level isn't changing)")
     args = ap.parse_args()
+
+    # Resolve capacity + calibration from (CLI > saved settings > default).
+    settings_path = None if str(args.settings).lower() == "none" else args.settings
+    saved = load_settings(settings_path)
+    capacity = _pick(args.capacity, saved.get("capacity"), 12.0)
+    cone_frac = _pick(args.cone_frac, saved.get("cone_frac"), 0.15)
+    empty_pct = _pick(args.empty_pct, saved.get("empty_pct"), 0.0)
+    full_pct = _pick(args.full_pct, saved.get("full_pct"), 1.0)
+    if saved:
+        print(f"[settings] loaded from {settings_path}")
+
+    # Ask for the capacity at startup if requested (default = resolved value).
+    if args.ask:
+        try:
+            raw = input(f"Tube capacity in mL [{capacity:g}]: ").strip()
+            if raw:
+                capacity = float(raw)
+        except (EOFError, ValueError):
+            print("  (keeping current capacity)")
+
+    def persist():
+        save_settings(settings_path, {"capacity": capacity, "cone_frac": cone_frac,
+                                      "empty_pct": empty_pct, "full_pct": full_pct})
 
     fmt = args.fmt.encode("ascii", "ignore").decode("unicode_escape")
 
@@ -389,9 +453,7 @@ def main():
     last_print = 0.0
     ema_vol = None        # smoothed value
     held_vol = None       # deadbanded value that is actually shown/sent
-    empty_pct = args.empty_pct   # ROI fraction that is 0 mL (live-calibratable)
-    full_pct = args.full_pct     # ROI fraction that is `capacity` mL
-    last_pct = 0.0
+    last_pct = 0.0        # empty_pct / full_pct / capacity / cone_frac resolved above
     if not args.no_window:
         print("\nCALIBRATION (in the window): fill to the tube's 0 mark and press "
               "'z'; fill to the full/capacity mark and press 'f'. 'p' prints values.")
@@ -404,8 +466,8 @@ def main():
                 continue
             now = time.time()
             viz, volume, status, cone_zoom, last_pct = process_frame(
-                frame, detector, vol_history, args.capacity,
-                cone_frac=args.cone_frac, use_original_curve=args.original_curve,
+                frame, detector, vol_history, capacity,
+                cone_frac=cone_frac, use_original_curve=args.original_curve,
                 cone_zone=args.cone_zone, cone_detect=not args.no_cone_detect,
                 detector_mode=args.detector, empty_pct=empty_pct, full_pct=full_pct,
                 want_viz=not args.no_window)
@@ -451,12 +513,15 @@ def main():
                     break
                 elif key == ord('z'):
                     empty_pct = last_pct
-                    print(f"[cal] 0 mL set at pos {empty_pct*100:.1f}%")
+                    persist()
+                    print(f"[cal] 0 mL set at pos {empty_pct*100:.1f}% (saved)")
                 elif key == ord('f'):
                     full_pct = last_pct
-                    print(f"[cal] full ({args.capacity:g} mL) set at pos {full_pct*100:.1f}%")
+                    persist()
+                    print(f"[cal] full ({capacity:g} mL) set at pos {full_pct*100:.1f}% (saved)")
                 elif key == ord('p'):
-                    print(f"[cal] --empty-pct {empty_pct:.4f} --full-pct {full_pct:.4f}")
+                    print(f"[cal] capacity {capacity:g}  --empty-pct {empty_pct:.4f} "
+                          f"--full-pct {full_pct:.4f}")
             else:
                 if now - last_print >= 0.5:
                     print(f"[level] {out_vol:5.1f} mL   (raw {volume:5.1f})   {status}",
@@ -469,9 +534,10 @@ def main():
         if serial_port:
             serial_port.close()
         cv2.destroyAllWindows()
-        if (empty_pct, full_pct) != (0.0, 1.0):
-            print(f"\n[cal] final calibration:  --empty-pct {empty_pct:.4f} "
-                  f"--full-pct {full_pct:.4f}  (add to your command / tanda_launch.sh)")
+        persist()   # remember capacity + calibration for next launch
+        if settings_path:
+            print(f"\n[settings] saved to {settings_path} "
+                  f"(capacity {capacity:g}, empty {empty_pct:.3f}, full {full_pct:.3f})")
 
 
 if __name__ == "__main__":
