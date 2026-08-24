@@ -28,8 +28,6 @@ Add a window (needs a display) by dropping --no-window.
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import time
 from collections import deque
 
@@ -38,57 +36,11 @@ import cv2
 
 from hardware import open_camera
 from aruco_compat import make_aruco_detector
-from liquid_level import MeniscusDetector, MeniscusConfig
-
-# Mark-rejecting multi-cue detector (built lazily so import stays cheap).
-_MULTICUE = None
-
-
-def _multicue():
-    global _MULTICUE
-    if _MULTICUE is None:
-        _MULTICUE = MeniscusDetector(MeniscusConfig())
-    return _MULTICUE
-
-
-# Default settings file lives next to this script so the desktop app finds it.
-DEFAULT_SETTINGS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "tube_settings.json")
-
-
-def load_settings(path):
-    if path and os.path.exists(path):
-        try:
-            with open(path) as fh:
-                return json.load(fh)
-        except Exception:
-            pass
-    return {}
-
-
-def save_settings(path, data):
-    if not path:
-        return
-    try:
-        with open(path, "w") as fh:
-            json.dump(data, fh, indent=2)
-    except Exception as e:  # noqa: BLE001
-        print(f"[settings] could not save {path}: {e}")
-
-
-def _pick(cli, saved, default):
-    """CLI value wins if given (not None); else saved; else the default."""
-    if cli is not None:
-        return cli
-    if saved is not None:
-        return saved
-    return default
 
 # --- Original detection settings (from the main-branch script) ---
 SMOOTHING_WINDOW = 15          # frames for median filtering of volume
 GRADIENT_FILTER_WIDTH = 0.80   # a line must span >= this fraction of the width
 GRADIENT_SUM_WIDTH = 0.20      # measure the middle this fraction of the tube
-CONE_MIN_SCORE = 2.6           # min prominence for a cone-region surface
 
 
 def calculate_volume_from_height(height_pct, max_capacity):
@@ -106,35 +58,6 @@ def calculate_volume_from_height(height_pct, max_capacity):
     v_remaining_range = max_capacity - v_at_split
     height_above_split = height_pct - h_split
     return v_at_split + (height_above_split / h_remaining_range) * v_remaining_range
-
-
-def calculate_volume_conical(height_pct, max_capacity, cone_frac):
-    """
-    Cone + cylinder volume model for a conical-bottom tube.
-
-    The bottom ``cone_frac`` of the measured height is a cone (radius growing
-    linearly from the tip), topped by a straight cylinder. The cone is narrow
-    near the tip, so its volume grows with the CUBE of height -- far less per mm
-    than the cylinder -- which is what makes bottom-of-tube readings accurate.
-
-      * for h <= cone:  V = C/(3D) * h^3 / f^2   (cubic)
-      * for h  > cone:  V = C * (h - 2f/3) / D    (linear)
-      f = cone_frac, D = 1 - 2f/3, h = height fraction (0..1), C = capacity.
-
-    cone_frac = 0 reduces to a straight linear fill; V(1) == max_capacity.
-    """
-    f = float(cone_frac)
-    if height_pct <= 0:
-        return 0.0
-    if height_pct >= 1:
-        return float(max_capacity)
-    if f <= 0:
-        return float(height_pct * max_capacity)
-    f = min(f, 0.99)
-    denom = 1.0 - (2.0 * f / 3.0)
-    if height_pct <= f:
-        return float(max_capacity / (3.0 * denom) * (height_pct ** 3) / (f * f))
-    return float(max_capacity * (height_pct - 2.0 * f / 3.0) / denom)
 
 
 def find_meniscus_gradient_mass(roi_gray):
@@ -178,75 +101,13 @@ def find_meniscus_gradient_mass(roi_gray):
     return best_y, grad_viz, max_score
 
 
-def detect_cone_meniscus(roi_enhanced, cone_zone):
+def process_frame(frame, detector, vol_history, tube_capacity, want_viz=True):
     """
-    Find the liquid surface inside the narrow conical bottom.
-
-    The main gradient detector needs a line spanning ~80% of the ROI width, but
-    in the cone the tube (and the surface) is much narrower, so that fails. Here
-    we look only at a central vertical strip -- the surface crosses the centre
-    no matter how narrow the cone gets -- and find the strongest horizontal
-    brightness step within the bottom ``cone_zone`` of the ROI.
-
-    Returns (surface_row_in_roi, prominence_score) or (-1, 0.0).
-    """
-    h, w = roi_enhanced.shape
-    ch = max(8, int(h * cone_zone))
-    y0 = h - ch
-    cone = roi_enhanced[y0:h, :]
-    cw = max(4, int(w * 0.34))
-    x0 = (w - cw) // 2
-    strip = cone[:, x0:x0 + cw].astype(np.float64)
-    strip = cv2.GaussianBlur(strip, (5, 1), 0)          # smooth across the strip
-    prof = strip.mean(axis=1)
-    prof = cv2.GaussianBlur(prof.reshape(-1, 1), (1, 5), 0).ravel()
-    grad = np.abs(np.gradient(prof))
-    m = max(1, int(ch * 0.08))                          # ignore very top/bottom
-    grad[:m] = 0
-    grad[len(grad) - m:] = 0
-    if grad.max() < 1e-6:
-        return -1, 0.0
-    best = int(np.argmax(grad))
-    base = np.median(grad[grad > 0]) if np.any(grad > 0) else 1.0
-    score = float(grad[best] / (base + 1e-6))
-    return y0 + best, score
-
-
-def build_cone_zoom(color_roi, cone_zone, target_h, surface_rel=None):
-    """A magnified panel of the bottom (cone) region of the tube for display."""
-    h, w = color_roi.shape[:2]
-    ch = max(8, int(h * cone_zone))
-    y0 = h - ch
-    cone = color_roi[y0:h, :].copy()
-    if cone.size == 0:
-        return None
-    scale = target_h / cone.shape[0]
-    new_w = int(min(240, max(70, cone.shape[1] * scale)))   # cap the panel width
-    panel = cv2.resize(cone, (new_w, target_h), interpolation=cv2.INTER_LINEAR)
-    if surface_rel is not None and surface_rel >= y0:
-        py = int((surface_rel - y0) * scale)
-        cv2.line(panel, (0, py), (new_w, py), (0, 255, 0), 2)
-    cv2.putText(panel, "CONE", (5, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-    return panel
-
-
-def process_frame(frame, detector, vol_history, tube_capacity,
-                  cone_frac=0.0, use_original_curve=False,
-                  cone_zone=0.28, cone_detect=True, detector_mode="gradient",
-                  empty_pct=0.0, full_pct=1.0, want_viz=True):
-    """
-    Original processing pipeline.
-    Returns (viz, current_volume, status, cone_zoom_panel_or_None, raw_pct).
-
-    empty_pct/full_pct are the ROI fractions (0 = bottom tag, 1 = top tag) that
-    correspond to the tube's 0 mL and full marks. They calibrate away the fact
-    that the tags aren't at the tube's zero/full lines. Default 0/1 = no cal.
+    Original processing pipeline. Returns (viz_or_None, current_volume, status).
     """
     h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     current_volume = 0.0
-    cone_zoom = None
-    raw_pct = 0.0
 
     corners, ids, _ = detector.detectMarkers(gray)
     detected_tags = []
@@ -281,39 +142,19 @@ def process_frame(frame, detector, vol_history, tube_capacity,
         if roi_gray.size > 0:
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             roi_enhanced = clahe.apply(roi_gray)
+            best_y_rel, _, gradient_score_val = find_meniscus_gradient_mass(roi_enhanced)
 
-            # Main detection: either the original gradient-mass finder, or the
-            # multi-cue finder that REJECTS graduation marks (for graduated /
-            # clear-liquid tubes).
-            if detector_mode == "multicue":
-                Hroi = roi_enhanced.shape[0]
-                res = _multicue().detect(roi_enhanced, 100.0 / max(Hroi, 1))
-                main_ok = res.found
-                best_y_rel = int(round(res.row)) if res.found else -1
-                lock_label = "Locked (Multi)"
-            else:
-                best_y_rel, _, gradient_score_val = find_meniscus_gradient_mass(roi_enhanced)
-                main_ok = best_y_rel != -1 and gradient_score_val >= 5000 * GRADIENT_SUM_WIDTH
-                lock_label = "Locked (Gradient)"
-
-            meniscus_rel = -1
-            if main_ok:
-                meniscus_rel = best_y_rel
-                status = lock_label
-            elif cone_detect:
-                # Wide-span found nothing -> the surface is likely low, in the
-                # narrow cone. Use the cone-focused (central-strip) detector.
-                cone_rel, cone_score = detect_cone_meniscus(roi_enhanced, cone_zone)
-                if cone_rel != -1 and cone_score >= CONE_MIN_SCORE:
-                    meniscus_rel = cone_rel
-                    status = "Locked (Cone)"
+            if best_y_rel != -1:
+                if gradient_score_val < 5000 * GRADIENT_SUM_WIDTH:
+                    meniscus_global_y = roi_y2
+                    status = f"Empty (Grad {int(gradient_score_val)})"
                 else:
-                    status = "Empty"
+                    meniscus_global_y = roi_y1 + best_y_rel
+                    status = "Locked (Gradient)"
             else:
-                status = ("Empty" if best_y_rel != -1 else "No Strong Edge")
+                status = "No Strong Edge"
 
-            if meniscus_rel != -1:
-                meniscus_global_y = roi_y1 + meniscus_rel
+            if meniscus_global_y != -1:
                 total_h = roi_y2 - roi_y1
                 liquid_h = roi_y2 - meniscus_global_y
                 pct = max(0.0, min(1.0, liquid_h / total_h))
@@ -326,15 +167,7 @@ def process_frame(frame, detector, vol_history, tube_capacity,
 
                 vol_history.append(pct)
                 pct = float(np.median(vol_history))
-                raw_pct = pct
-                # Map ROI fraction -> true tube fraction using the calibration
-                # anchors, then apply the volume curve.
-                span = full_pct - empty_pct
-                tube_pct = pct if span <= 1e-6 else max(0.0, min(1.0, (pct - empty_pct) / span))
-                if use_original_curve:
-                    current_volume = calculate_volume_from_height(tube_pct, tube_capacity)
-                else:
-                    current_volume = calculate_volume_conical(tube_pct, tube_capacity, cone_frac)
+                current_volume = calculate_volume_from_height(pct, tube_capacity)
 
                 if want_viz:
                     cv2.line(view_result, (roi_x1 - 20, meniscus_global_y),
@@ -342,53 +175,20 @@ def process_frame(frame, detector, vol_history, tube_capacity,
                     label = f"{current_volume:.1f}ml ({(current_volume/tube_capacity)*100:.0f}%)"
                     cv2.putText(view_result, label, (roi_x2 + 15, meniscus_global_y),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-            else:
-                meniscus_global_y = roi_y2
-
-            # Zoomed cone panel (shows the liquid in the narrow bottom).
-            if want_viz:
-                cone_zoom = build_cone_zoom(
-                    frame[roi_y1:roi_y2, roi_x1:roi_x2], cone_zone,
-                    view_result.shape[0],
-                    surface_rel=(meniscus_rel if meniscus_rel != -1 else None))
     else:
         status = "No Tags Found" if ids is None else "ROI Error"
 
     if want_viz:
         cv2.putText(view_result, status, (20, h - 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
-    return view_result, current_volume, status, cone_zoom, raw_pct
+    return view_result, current_volume, status
 
 
 def main():
     ap = argparse.ArgumentParser(description="Original gradient detection + streaming pump comms")
     ap.add_argument("--port", default=None, help="pump serial port, e.g. /dev/ttyUSB0")
     ap.add_argument("--baud", type=int, default=9600)
-    ap.add_argument("--capacity", type=float, default=None, help="tube capacity in mL")
-    ap.add_argument("--ask", action="store_true",
-                    help="prompt for the tube capacity at startup")
-    ap.add_argument("--settings", default=DEFAULT_SETTINGS,
-                    help="JSON file to remember capacity + calibration (use "
-                         "'none' to disable)")
-    ap.add_argument("--cone-frac", type=float, default=None,
-                    help="fraction of the measured height taken by the conical "
-                         "bottom (cone height / distance between the two tags). "
-                         "Makes bottom-of-tube volumes accurate. 0 = linear.")
-    ap.add_argument("--original-curve", action="store_true",
-                    help="use the old 2/15 piece-wise curve instead of the cone model")
-    ap.add_argument("--cone-zone", type=float, default=0.28,
-                    help="bottom fraction of the tube treated as the cone: shown "
-                         "in the zoom panel and where cone-focused detection runs")
-    ap.add_argument("--no-cone-detect", action="store_true",
-                    help="disable the cone-focused detector (only wide-span)")
-    ap.add_argument("--detector", choices=["gradient", "multicue"], default="gradient",
-                    help="meniscus finder: 'gradient' (original) or 'multicue' "
-                         "(rejects graduation marks -- use for graduated / clear tubes)")
-    ap.add_argument("--empty-pct", type=float, default=None,
-                    help="ROI fraction (0=bottom tag..1=top tag) that reads 0 mL; "
-                         "set live with 'z'. Corrects the tube's zero offset.")
-    ap.add_argument("--full-pct", type=float, default=None,
-                    help="ROI fraction that reads `capacity` mL; set live with 'f'.")
+    ap.add_argument("--capacity", type=float, default=12.0, help="tube capacity in mL")
     ap.add_argument("--interval", type=float, default=0.5, help="seconds between streamed lines")
     ap.add_argument("--format", dest="fmt", default=r"{volume:.1f}mL\r\n",
                     help=r"streamed ASCII line; use {volume} and \r \n (default '{volume:.1f}mL\r\n')")
@@ -403,29 +203,6 @@ def main():
                     help="mL; the shown/sent value only moves when it changes by "
                          "more than this (holds steady when the level isn't changing)")
     args = ap.parse_args()
-
-    # Resolve capacity + calibration from (CLI > saved settings > default).
-    settings_path = None if str(args.settings).lower() == "none" else args.settings
-    saved = load_settings(settings_path)
-    capacity = _pick(args.capacity, saved.get("capacity"), 12.0)
-    cone_frac = _pick(args.cone_frac, saved.get("cone_frac"), 0.15)
-    empty_pct = _pick(args.empty_pct, saved.get("empty_pct"), 0.0)
-    full_pct = _pick(args.full_pct, saved.get("full_pct"), 1.0)
-    if saved:
-        print(f"[settings] loaded from {settings_path}")
-
-    # Ask for the capacity at startup if requested (default = resolved value).
-    if args.ask:
-        try:
-            raw = input(f"Tube capacity in mL [{capacity:g}]: ").strip()
-            if raw:
-                capacity = float(raw)
-        except (EOFError, ValueError):
-            print("  (keeping current capacity)")
-
-    def persist():
-        save_settings(settings_path, {"capacity": capacity, "cone_frac": cone_frac,
-                                      "empty_pct": empty_pct, "full_pct": full_pct})
 
     fmt = args.fmt.encode("ascii", "ignore").decode("unicode_escape")
 
@@ -453,10 +230,6 @@ def main():
     last_print = 0.0
     ema_vol = None        # smoothed value
     held_vol = None       # deadbanded value that is actually shown/sent
-    last_pct = 0.0        # empty_pct / full_pct / capacity / cone_frac resolved above
-    if not args.no_window:
-        print("\nCALIBRATION (in the window): fill to the tube's 0 mark and press "
-              "'z'; fill to the full/capacity mark and press 'f'. 'p' prints values.")
     print("\nSystem ready. Ctrl-C (headless) or 'q' (window) to quit.")
 
     try:
@@ -465,12 +238,8 @@ def main():
             if frame is None:
                 continue
             now = time.time()
-            viz, volume, status, cone_zoom, last_pct = process_frame(
-                frame, detector, vol_history, capacity,
-                cone_frac=cone_frac, use_original_curve=args.original_curve,
-                cone_zone=args.cone_zone, cone_detect=not args.no_cone_detect,
-                detector_mode=args.detector, empty_pct=empty_pct, full_pct=full_pct,
-                want_viz=not args.no_window)
+            viz, volume, status = process_frame(
+                frame, detector, vol_history, args.capacity, want_viz=not args.no_window)
 
             # --- Stabilisation pipeline -------------------------------------
             # The median (done in process_frame over --smooth frames) already
@@ -498,30 +267,9 @@ def main():
                 if viz is not None:
                     cv2.putText(viz, f"{out_vol:.1f} mL (stable)", (20, 40),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-                    cv2.putText(viz, f"pos {last_pct*100:4.0f}%  cal[0mL={empty_pct*100:.0f}%"
-                                f" full={full_pct*100:.0f}%]  z/f=set p=print",
-                                (20, viz.shape[0] - 60), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.6, (0, 255, 255), 2)
-                    # Show the zoomed cone panel alongside the main view.
-                    if cone_zoom is not None and cone_zoom.shape[0] == viz.shape[0]:
-                        display = np.hstack([viz, cone_zoom])
-                    else:
-                        display = viz
-                    cv2.imshow(window, display)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
+                    cv2.imshow(window, viz)
+                if (cv2.waitKey(1) & 0xFF) == ord('q'):
                     break
-                elif key == ord('z'):
-                    empty_pct = last_pct
-                    persist()
-                    print(f"[cal] 0 mL set at pos {empty_pct*100:.1f}% (saved)")
-                elif key == ord('f'):
-                    full_pct = last_pct
-                    persist()
-                    print(f"[cal] full ({capacity:g} mL) set at pos {full_pct*100:.1f}% (saved)")
-                elif key == ord('p'):
-                    print(f"[cal] capacity {capacity:g}  --empty-pct {empty_pct:.4f} "
-                          f"--full-pct {full_pct:.4f}")
             else:
                 if now - last_print >= 0.5:
                     print(f"[level] {out_vol:5.1f} mL   (raw {volume:5.1f})   {status}",
@@ -534,10 +282,6 @@ def main():
         if serial_port:
             serial_port.close()
         cv2.destroyAllWindows()
-        persist()   # remember capacity + calibration for next launch
-        if settings_path:
-            print(f"\n[settings] saved to {settings_path} "
-                  f"(capacity {capacity:g}, empty {empty_pct:.3f}, full {full_pct:.3f})")
 
 
 if __name__ == "__main__":

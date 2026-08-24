@@ -8,9 +8,7 @@
 # ----------------------- SETTINGS (edit these) -----------------------
 PORT="/dev/ttyUSB0"     # pump serial port (see: ls /dev/ttyUSB* /dev/ttyACM*)
 BAUD="9600"             # pump baud rate
-CAPACITY="12"           # default tube capacity in mL (shown in the prompt)
-DETECTOR="multicue"     # "multicue" (graduated/clear tubes) or "gradient"
-ASK="yes"               # "yes" = ask for the tube capacity at startup
+CAPACITY="12"           # tube capacity in mL
 EXTRA_ARGS=""           # e.g. "--smooth 45 --deadband 0.2 --interval 0.5"
 SHOW_WINDOW="yes"       # "yes" = show the video window; "no" = headless
 # ---------------------------------------------------------------------
@@ -33,13 +31,9 @@ fi
 WINDOW_ARG=""
 [ "$SHOW_WINDOW" = "no" ] && WINDOW_ARG="--no-window"
 
-ASK_ARG=""
-[ "$ASK" = "yes" ] && ASK_ARG="--ask"
-
 echo "Starting Tanda Liquid Monitor..."
 "$PY" liquid_detection/liquid_level_legacy.py \
-    --capacity "$CAPACITY" --detector "$DETECTOR" $ASK_ARG \
-    $PORT_ARG $WINDOW_ARG $EXTRA_ARGS
+    --capacity "$CAPACITY" $PORT_ARG $WINDOW_ARG $EXTRA_ARGS
 
 # Keep the terminal open so any message is readable after it exits.
 echo ""
