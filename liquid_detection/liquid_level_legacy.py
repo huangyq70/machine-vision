@@ -36,6 +36,17 @@ import cv2
 
 from hardware import open_camera
 from aruco_compat import make_aruco_detector
+from liquid_level import MeniscusDetector, MeniscusConfig
+
+# Mark-rejecting multi-cue detector (built lazily so import stays cheap).
+_MULTICUE = None
+
+
+def _multicue():
+    global _MULTICUE
+    if _MULTICUE is None:
+        _MULTICUE = MeniscusDetector(MeniscusConfig())
+    return _MULTICUE
 
 # --- Original detection settings (from the main-branch script) ---
 SMOOTHING_WINDOW = 15          # frames for median filtering of volume
@@ -185,7 +196,8 @@ def build_cone_zoom(color_roi, cone_zone, target_h, surface_rel=None):
 
 def process_frame(frame, detector, vol_history, tube_capacity,
                   cone_frac=0.0, use_original_curve=False,
-                  cone_zone=0.28, cone_detect=True, want_viz=True):
+                  cone_zone=0.28, cone_detect=True, detector_mode="gradient",
+                  want_viz=True):
     """
     Original processing pipeline.
     Returns (viz_or_None, current_volume, status, cone_zoom_panel_or_None).
@@ -228,13 +240,25 @@ def process_frame(frame, detector, vol_history, tube_capacity,
         if roi_gray.size > 0:
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             roi_enhanced = clahe.apply(roi_gray)
-            best_y_rel, _, gradient_score_val = find_meniscus_gradient_mass(roi_enhanced)
 
-            # Main (wide-span) detection.
+            # Main detection: either the original gradient-mass finder, or the
+            # multi-cue finder that REJECTS graduation marks (for graduated /
+            # clear-liquid tubes).
+            if detector_mode == "multicue":
+                Hroi = roi_enhanced.shape[0]
+                res = _multicue().detect(roi_enhanced, 100.0 / max(Hroi, 1))
+                main_ok = res.found
+                best_y_rel = int(round(res.row)) if res.found else -1
+                lock_label = "Locked (Multi)"
+            else:
+                best_y_rel, _, gradient_score_val = find_meniscus_gradient_mass(roi_enhanced)
+                main_ok = best_y_rel != -1 and gradient_score_val >= 5000 * GRADIENT_SUM_WIDTH
+                lock_label = "Locked (Gradient)"
+
             meniscus_rel = -1
-            if best_y_rel != -1 and gradient_score_val >= 5000 * GRADIENT_SUM_WIDTH:
+            if main_ok:
                 meniscus_rel = best_y_rel
-                status = "Locked (Gradient)"
+                status = lock_label
             elif cone_detect:
                 # Wide-span found nothing -> the surface is likely low, in the
                 # narrow cone. Use the cone-focused (central-strip) detector.
@@ -306,6 +330,9 @@ def main():
                          "in the zoom panel and where cone-focused detection runs")
     ap.add_argument("--no-cone-detect", action="store_true",
                     help="disable the cone-focused detector (only wide-span)")
+    ap.add_argument("--detector", choices=["gradient", "multicue"], default="gradient",
+                    help="meniscus finder: 'gradient' (original) or 'multicue' "
+                         "(rejects graduation marks -- use for graduated / clear tubes)")
     ap.add_argument("--interval", type=float, default=0.5, help="seconds between streamed lines")
     ap.add_argument("--format", dest="fmt", default=r"{volume:.1f}mL\r\n",
                     help=r"streamed ASCII line; use {volume} and \r \n (default '{volume:.1f}mL\r\n')")
@@ -359,7 +386,7 @@ def main():
                 frame, detector, vol_history, args.capacity,
                 cone_frac=args.cone_frac, use_original_curve=args.original_curve,
                 cone_zone=args.cone_zone, cone_detect=not args.no_cone_detect,
-                want_viz=not args.no_window)
+                detector_mode=args.detector, want_viz=not args.no_window)
 
             # --- Stabilisation pipeline -------------------------------------
             # The median (done in process_frame over --smooth frames) already
